@@ -219,6 +219,29 @@ async function hmacSign(data: string, key: string): Promise<string> {
   return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+// ─── Scoped Token Capability Enforcement ───────────────────────────────────────
+
+// Maps secret names to provider capabilities
+function secretToProvider(secretName: string): string | null {
+  const n = secretName.toUpperCase();
+  if (n.includes('OPENAI')) return 'openai';
+  if (n.includes('ANTHROPIC') || n.includes('CLAUDE')) return 'anthropic';
+  if (n.includes('GEMINI') || n.includes('GOOGLE')) return 'google';
+  if (n.includes('AWS')) return 'aws';
+  if (n.includes('GITHUB')) return 'github';
+  if (n.includes('CLOUDFLARE')) return 'cloudflare';
+  if (n.includes('NOTION')) return 'notion';
+  if (n.includes('BRAVE')) return 'brave';
+  return null;
+}
+
+// Check if a scoped token is allowed to access a given service/secret
+function checkScopedCapability(c: any, provider: string): boolean {
+  const scoped = c.get('scopedToken') as { caps?: string[] } | undefined;
+  if (!scoped?.caps) return true; // Not a scoped token — no restriction
+  return scoped.caps.includes(provider) || scoped.caps.includes('*');
+}
+
 // ─── Get Secret ────────────────────────────────────────────────────────────────
 
 apiRoutes.post('/secrets/get', async (c) => {
@@ -230,6 +253,13 @@ apiRoutes.post('/secrets/get', async (c) => {
   const body = await c.req.json<SecretGetRequest>();
   if (!body.name) {
     return c.json({ ok: false, error: 'Missing "name" field' }, 400);
+  }
+
+  // Scoped token capability check
+  const provider = secretToProvider(body.name);
+  if (provider && !checkScopedCapability(c, provider)) {
+    await db.logAudit(c.env.DB, agent.client_id, agent.id, 'secret.get', body.name, 'denied', null, 'scoped token lacks capability');
+    return c.json({ ok: false, error: `Scoped token does not have '${provider}' capability` }, 403);
   }
   
   // Pass agent.id to filter by access permissions
@@ -258,7 +288,18 @@ apiRoutes.post('/secrets/list', async (c) => {
   
   // Pass agent.id to filter by access permissions
   const secrets = await db.listSecrets(c.env.DB, agent.client_id, agent.id);
-  const secretInfos = secrets.map(s => ({ name: s.name, provider: s.provider }));
+  
+  // Filter by scoped token capabilities if applicable
+  const scopedInfo: { caps?: string[] } | undefined = (c as any).get('scopedToken');
+  let filtered = secrets;
+  if (scopedInfo?.caps) {
+    filtered = secrets.filter((s: any) => {
+      const provider = secretToProvider(s.name);
+      if (!provider) return false;
+      return scopedInfo.caps!.includes(provider) || scopedInfo.caps!.includes('*');
+    });
+  }
+  const secretInfos = filtered.map((s: any) => ({ name: s.name, provider: s.provider }));
   
   await db.logAudit(c.env.DB, agent.client_id, agent.id, 'secret.list', null, 'success');
   return c.json({ ok: true, secrets: secretInfos });
@@ -324,6 +365,12 @@ apiRoutes.post('/proxy/request', async (c) => {
   const config = SERVICE_CONFIG[body.service];
   if (!config) {
     return c.json({ ok: false, error: `Unknown service: ${body.service}` }, 400);
+  }
+
+  // Scoped token capability check
+  if (!checkScopedCapability(c, body.service)) {
+    await db.logAudit(c.env.DB, agent.client_id, agent.id, 'proxy.request', body.service, 'denied', null, 'scoped token lacks capability');
+    return c.json({ ok: false, error: `Scoped token does not have '${body.service}' capability` }, 403);
   }
   
   // Get the API key (with agent access check)
