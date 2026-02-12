@@ -3,7 +3,7 @@
  */
 
 import { Hono } from 'hono';
-import type { Env, SecretGetRequest, ProxyRequest } from './types';
+import type { Agent, Env, SecretGetRequest, ProxyRequest } from './types';
 import * as db from './db';
 import { decrypt, encrypt, hashPassword } from './crypto';
 
@@ -11,13 +11,29 @@ export const apiRoutes = new Hono<{ Bindings: Env }>();
 
 // ─── Auth Helper ───────────────────────────────────────────────────────────────
 
-async function authenticateAgent(c: any) {
+async function authenticateAgent(c: any): Promise<Agent | null> {
   const authHeader = c.req.header('Authorization');
   if (!authHeader?.startsWith('Bearer ')) {
     return null;
   }
   
   const token = authHeader.slice(7);
+
+  // Check for scoped token first
+  if (token.startsWith('seks_scoped_')) {
+    const masterKey = getMasterKey(c.env);
+    const payload = await verifyScopedToken(token, masterKey);
+    if (!payload) return null;
+
+    const agent = await db.getAgentById(c.env.DB, payload.agent_id);
+    if (!agent || agent.client_id !== payload.client_id) return null;
+
+    c.executionCtx.waitUntil(db.updateAgentLastSeen(c.env.DB, agent.id));
+    // Stash scoped info on the context for downstream capability checks
+    c.set('scopedToken', payload);
+    return agent;
+  }
+
   const agent = await db.getAgentByToken(c.env.DB, token);
   
   if (agent) {
@@ -96,6 +112,111 @@ function guessProvider(name: string): string {
   if (n.includes('NOTION')) return 'notion';
   if (n.includes('BRAVE')) return 'brave';
   return 'other';
+}
+
+// ─── Scoped Tokens ─────────────────────────────────────────────────────────────
+//
+// POST /v1/tokens/scoped
+// Mints a short-lived scoped token for skill execution.
+// The scoped token is an HMAC-SHA256 signed JSON payload containing:
+//   - agent_id, client_id, skillName, capabilities, exp
+// Only the declared capabilities are usable with the scoped token.
+
+apiRoutes.post('/tokens/scoped', async (c) => {
+  const agent = await authenticateAgent(c);
+  if (!agent) {
+    return c.json({ ok: false, error: 'Unauthorized' }, 401);
+  }
+
+  const body = await c.req.json<{
+    skillName: string;
+    capabilities: string[];
+    ttlSeconds?: number;
+  }>();
+
+  if (!body.skillName || !Array.isArray(body.capabilities) || body.capabilities.length === 0) {
+    return c.json({ ok: false, error: 'Missing skillName or capabilities' }, 400);
+  }
+
+  // Enforce TTL limits: default 5min, max 30min
+  const ttl = Math.min(Math.max(body.ttlSeconds || 300, 10), 1800);
+  const now = Date.now();
+  const expiresAt = new Date(now + ttl * 1000).toISOString();
+
+  // Check agent scopes — if agent has scopes defined, scoped token can't escalate
+  const agentScopes: string[] = JSON.parse(agent.scopes || '[]');
+  if (agentScopes.length > 0) {
+    const disallowed = body.capabilities.filter(cap => !agentScopes.includes(cap));
+    if (disallowed.length > 0) {
+      await db.logAudit(c.env.DB, agent.client_id, agent.id, 'token.scoped', body.skillName, 'denied', null, `escalation: ${disallowed.join(',')}`);
+      return c.json({ ok: false, error: `Capabilities exceed agent scope: ${disallowed.join(', ')}` }, 403);
+    }
+  }
+
+  // Build the token payload
+  const payload = {
+    type: 'scoped',
+    agent_id: agent.id,
+    client_id: agent.client_id,
+    skill: body.skillName,
+    caps: body.capabilities,
+    iat: now,
+    exp: now + ttl * 1000,
+  };
+
+  // Sign it with HMAC-SHA256 using the master key
+  const masterKey = getMasterKey(c.env);
+  const payloadB64 = btoa(JSON.stringify(payload));
+  const sig = await hmacSign(payloadB64, masterKey);
+  const token = `seks_scoped_${payloadB64}.${sig}`;
+
+  await db.logAudit(c.env.DB, agent.client_id, agent.id, 'token.scoped', body.skillName, 'success', null, `caps=${body.capabilities.join(',')},ttl=${ttl}s`);
+
+  return c.json({ ok: true, token, expiresAt });
+});
+
+// Verify and decode a scoped token (used internally by proxy/secret endpoints)
+async function verifyScopedToken(token: string, masterKey: string): Promise<{
+  agent_id: string;
+  client_id: string;
+  skill: string;
+  caps: string[];
+  exp: number;
+} | null> {
+  if (!token.startsWith('seks_scoped_')) return null;
+  const stripped = token.slice('seks_scoped_'.length);
+  const dotIdx = stripped.lastIndexOf('.');
+  if (dotIdx === -1) return null;
+
+  const payloadB64 = stripped.slice(0, dotIdx);
+  const sig = stripped.slice(dotIdx + 1);
+
+  // Verify signature
+  const expectedSig = await hmacSign(payloadB64, masterKey);
+  if (sig !== expectedSig) return null;
+
+  try {
+    const payload = JSON.parse(atob(payloadB64));
+    if (payload.type !== 'scoped') return null;
+    if (Date.now() > payload.exp) return null; // expired
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+// HMAC-SHA256 sign and return hex
+async function hmacSign(data: string, key: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(key),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', cryptoKey, encoder.encode(data));
+  return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
 // ─── Get Secret ────────────────────────────────────────────────────────────────
