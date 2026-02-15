@@ -1,8 +1,8 @@
 /**
- * Cryptographic utilities using Web Crypto API
- * 
- * Uses AES-GCM for encryption (well-supported in Workers)
+ * Cryptographic utilities using Node.js crypto module
  */
+
+import crypto from 'node:crypto';
 
 // Generate a random UUID
 export function generateId(): string {
@@ -11,142 +11,90 @@ export function generateId(): string {
 
 // Generate a random token with prefix
 export function generateToken(prefix: string): string {
-  const bytes = new Uint8Array(24);
-  crypto.getRandomValues(bytes);
-  const base64 = btoa(String.fromCharCode(...bytes))
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=/g, '');
-  return `${prefix}_${base64}`;
+  const bytes = crypto.randomBytes(24);
+  const base64 = bytes.toString('base64url');
+  return prefix ? `${prefix}_${base64}` : base64;
+}
+
+// Hash a token (for storage) using SHA-256
+export function hashToken(token: string): string {
+  return crypto.createHash('sha256').update(token).digest('hex');
 }
 
 // Derive an AES key from the master key (hex string)
-async function getKey(masterKey: string): Promise<CryptoKey> {
-  const keyBytes = hexToBytes(masterKey);
-  return crypto.subtle.importKey(
-    'raw',
-    keyBytes,
-    { name: 'AES-GCM' },
-    false,
-    ['encrypt', 'decrypt']
-  );
+function getKeyBuffer(masterKey: string): Buffer {
+  return Buffer.from(masterKey, 'hex');
 }
 
-// Encrypt plaintext, return base64(iv + ciphertext)
-export async function encrypt(plaintext: string, masterKey: string): Promise<string> {
-  const key = await getKey(masterKey);
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const encoded = new TextEncoder().encode(plaintext);
-  
-  const ciphertext = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    key,
-    encoded
-  );
-  
-  // Combine IV + ciphertext
-  const combined = new Uint8Array(iv.length + ciphertext.byteLength);
-  combined.set(iv);
-  combined.set(new Uint8Array(ciphertext), iv.length);
-  
-  return btoa(String.fromCharCode(...combined));
+// Encrypt plaintext, return base64(iv + ciphertext + authTag)
+export function encrypt(plaintext: string, masterKey: string): string {
+  const key = getKeyBuffer(masterKey);
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+
+  const encrypted = Buffer.concat([
+    cipher.update(plaintext, 'utf8'),
+    cipher.final(),
+  ]);
+  const authTag = cipher.getAuthTag();
+
+  // iv (12) + ciphertext + authTag (16)
+  const combined = Buffer.concat([iv, encrypted, authTag]);
+  return combined.toString('base64');
 }
 
-// Decrypt base64(iv + ciphertext), return plaintext
-export async function decrypt(encrypted: string, masterKey: string): Promise<string> {
-  const key = await getKey(masterKey);
-  const combined = Uint8Array.from(atob(encrypted), c => c.charCodeAt(0));
-  
-  const iv = combined.slice(0, 12);
-  const ciphertext = combined.slice(12);
-  
-  const decrypted = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv },
-    key,
-    ciphertext
-  );
-  
-  return new TextDecoder().decode(decrypted);
+// Decrypt base64(iv + ciphertext + authTag), return plaintext
+export function decrypt(encryptedB64: string, masterKey: string): string {
+  const key = getKeyBuffer(masterKey);
+  const combined = Buffer.from(encryptedB64, 'base64');
+
+  const iv = combined.subarray(0, 12);
+  const authTag = combined.subarray(combined.length - 16);
+  const ciphertext = combined.subarray(12, combined.length - 16);
+
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(authTag);
+
+  const decrypted = Buffer.concat([
+    decipher.update(ciphertext),
+    decipher.final(),
+  ]);
+  return decrypted.toString('utf8');
 }
 
-// Hash password using PBKDF2 (Web Crypto compatible)
-export async function hashPassword(password: string): Promise<string> {
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const encoder = new TextEncoder();
-  const passwordKey = await crypto.subtle.importKey(
-    'raw',
-    encoder.encode(password),
-    'PBKDF2',
-    false,
-    ['deriveBits']
-  );
-  
-  const hash = await crypto.subtle.deriveBits(
-    {
-      name: 'PBKDF2',
-      salt,
-      iterations: 100000,
-      hash: 'SHA-256'
-    },
-    passwordKey,
-    256
-  );
-  
-  // Format: salt$hash (both base64)
-  const saltB64 = btoa(String.fromCharCode(...salt));
-  const hashB64 = btoa(String.fromCharCode(...new Uint8Array(hash)));
-  return `${saltB64}$${hashB64}`;
+// Hash password using PBKDF2
+export function hashPassword(password: string): string {
+  const salt = crypto.randomBytes(16);
+  const hash = crypto.pbkdf2Sync(password, salt, 100000, 32, 'sha256');
+  return `${salt.toString('base64')}$${hash.toString('base64')}`;
 }
 
 // Verify password against stored hash
-export async function verifyPassword(password: string, storedHash: string): Promise<boolean> {
+export function verifyPassword(password: string, storedHash: string): boolean {
   const [saltB64, hashB64] = storedHash.split('$');
   if (!saltB64 || !hashB64) return false;
-  
-  const salt = Uint8Array.from(atob(saltB64), c => c.charCodeAt(0));
-  const encoder = new TextEncoder();
-  const passwordKey = await crypto.subtle.importKey(
-    'raw',
-    encoder.encode(password),
-    'PBKDF2',
-    false,
-    ['deriveBits']
-  );
-  
-  const hash = await crypto.subtle.deriveBits(
-    {
-      name: 'PBKDF2',
-      salt,
-      iterations: 100000,
-      hash: 'SHA-256'
-    },
-    passwordKey,
-    256
-  );
-  
-  const computedB64 = btoa(String.fromCharCode(...new Uint8Array(hash)));
-  return computedB64 === hashB64;
+
+  const salt = Buffer.from(saltB64, 'base64');
+  const hash = crypto.pbkdf2Sync(password, salt, 100000, 32, 'sha256');
+  return hash.toString('base64') === hashB64;
 }
 
 // Generate a master key (for initial setup)
 export function generateMasterKey(): string {
-  const bytes = new Uint8Array(32);
-  crypto.getRandomValues(bytes);
-  return bytesToHex(bytes);
+  return crypto.randomBytes(32).toString('hex');
 }
 
-// Utility: hex string to bytes
-function hexToBytes(hex: string): Uint8Array {
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < bytes.length; i++) {
-    bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
-  }
-  return bytes;
+// HMAC-SHA256 sign and return hex
+export function hmacSign(data: string, key: string): string {
+  return crypto.createHmac('sha256', key).update(data).digest('hex');
 }
 
-// Utility: bytes to hex string
-function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes)
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
+// SHA-256 hex digest
+export function sha256Hex(data: Buffer | string): string {
+  return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+// HMAC-SHA256 returning raw buffer
+export function hmacSha256(key: Buffer, data: string): Buffer {
+  return crypto.createHmac('sha256', key).update(data).digest();
 }

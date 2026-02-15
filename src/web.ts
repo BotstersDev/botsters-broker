@@ -4,7 +4,7 @@
 
 import { Hono } from 'hono';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
-import type { Env, Client, Agent, Secret, AuditEntry } from './types';
+import type { Env, Account, Agent, Secret, AuditEntry } from './types';
 import * as db from './db';
 import { encrypt, hashPassword, verifyPassword } from './crypto';
 import { html, raw } from 'hono/html';
@@ -13,23 +13,19 @@ export const webRoutes = new Hono<{ Bindings: Env }>();
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
-async function getSessionClient(c: any): Promise<string | null> {
+function getSessionAccount(c: any): string | null {
   const sessionId = getCookie(c, 'session');
   if (!sessionId) return null;
-  
-  const session = await db.getSession(c.env.DB, sessionId);
-  return session?.client_id ?? null;
+  const session = db.getSession(c.env.db, sessionId);
+  return session?.account_id ?? null;
 }
 
 function getMasterKey(env: Env): string {
-  return env.MASTER_KEY || 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
+  return env.masterKey;
 }
 
 function redirect(path: string) {
-  return new Response(null, {
-    status: 302,
-    headers: { Location: path },
-  });
+  return new Response(null, { status: 302, headers: { Location: path } });
 }
 
 // ─── Templates ─────────────────────────────────────────────────────────────────
@@ -39,7 +35,7 @@ const baseStyles = `
     --bg: #0a0a0a; --bg-secondary: #141414; --bg-tertiary: #1f1f1f;
     --text: #e5e5e5; --text-muted: #737373;
     --accent: #22c55e; --accent-hover: #16a34a;
-    --danger: #ef4444; --border: #262626;
+    --danger: #ef4444; --warning: #f59e0b; --border: #262626;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; min-height: 100vh; }
@@ -77,7 +73,9 @@ const baseStyles = `
   .alert-error { background: rgba(239, 68, 68, 0.1); border: 1px solid var(--danger); color: var(--danger); }
   .badge { display: inline-block; padding: 0.25rem 0.5rem; border-radius: 9999px; font-size: 0.75rem; }
   .badge-success { background: rgba(34, 197, 94, 0.2); color: var(--accent); }
+  .badge-warning { background: rgba(245, 158, 11, 0.2); color: var(--warning); }
   .badge-muted { background: var(--bg-tertiary); color: var(--text-muted); }
+  .badge-danger { background: rgba(239, 68, 68, 0.2); color: var(--danger); }
   .token { font-family: monospace; font-size: 0.875rem; background: var(--bg-tertiary); padding: 0.25rem 0.5rem; border-radius: 0.25rem; }
   .empty { text-align: center; padding: 3rem; color: var(--text-muted); }
   .auth-container { max-width: 400px; margin: 4rem auto; padding: 0 1rem; }
@@ -115,6 +113,7 @@ function navBar(active: string) {
       <li><a href="/dashboard" class="${active === 'dashboard' ? 'active' : ''}">Dashboard</a></li>
       <li><a href="/secrets" class="${active === 'secrets' ? 'active' : ''}">Secrets</a></li>
       <li><a href="/agents" class="${active === 'agents' ? 'active' : ''}">Agents</a></li>
+      <li><a href="/actuators" class="${active === 'actuators' ? 'active' : ''}">Actuators</a></li>
       <li><a href="/activity" class="${active === 'activity' ? 'active' : ''}">Activity</a></li>
     </ul>
     <form method="POST" action="/logout" style="margin: 0;">
@@ -125,7 +124,6 @@ function navBar(active: string) {
 
 // ─── Routes ────────────────────────────────────────────────────────────────────
 
-// Landing page
 webRoutes.get('/', (c) => {
   const content = html`
     <div class="auth-container" style="max-width: 600px; margin-top: 6rem;">
@@ -133,19 +131,13 @@ webRoutes.get('/', (c) => {
         <h1 style="font-size: 3rem; margin-bottom: 0.5rem;">
           <span style="color: var(--accent);">SEKS</span> Broker
         </h1>
-        <p class="text-muted" style="font-size: 1.25rem;">
-          Cloud-native secret management for AI agents
-        </p>
+        <p class="text-muted" style="font-size: 1.25rem;">Cloud-native secret management for AI agents</p>
       </div>
       <div class="card" style="margin-top: 3rem;">
         <h2 class="text-center">Bring Your Own Keys</h2>
-        <p class="text-muted text-center" style="margin-bottom: 1.5rem;">
-          Everything just works. Your agents, your keys, zero setup friction.
-        </p>
+        <p class="text-muted text-center" style="margin-bottom: 1.5rem;">Everything just works. Your agents, your keys, zero setup friction.</p>
         <div class="text-center">
-          <a href="/login" class="btn btn-primary" style="font-size: 1.125rem; padding: 1rem 2rem;">
-            Get Started →
-          </a>
+          <a href="/login" class="btn btn-primary" style="font-size: 1.125rem; padding: 1rem 2rem;">Get Started →</a>
         </div>
       </div>
     </div>
@@ -153,7 +145,6 @@ webRoutes.get('/', (c) => {
   return c.html(layout('Welcome', content));
 });
 
-// Login page
 webRoutes.get('/login', (c) => {
   const content = html`
     <div class="auth-container">
@@ -170,30 +161,25 @@ webRoutes.get('/login', (c) => {
           </div>
           <button type="submit" class="btn btn-primary" style="width: 100%;">Sign In</button>
         </form>
-        <p class="text-muted text-center mt-2" style="font-size: 0.875rem;">
-          New here? Just enter your email and password to create an account.
-        </p>
+        <p class="text-muted text-center mt-2" style="font-size: 0.875rem;">New here? Just enter your email and password to create an account.</p>
       </div>
     </div>
   `;
   return c.html(layout('Login', content));
 });
 
-// Login submit
 webRoutes.post('/login', async (c) => {
   const body = await c.req.parseBody();
   const email = body.email as string;
   const password = body.password as string;
-  
-  let client = await db.getClientByEmail(c.env.DB, email);
-  
-  if (!client) {
-    // Auto-register
-    const hash = await hashPassword(password);
-    client = await db.createClient(c.env.DB, email, hash);
+
+  let account = db.getAccountByEmail(c.env.db, email);
+
+  if (!account) {
+    const hash = hashPassword(password);
+    account = db.createAccount(c.env.db, email, hash);
   } else {
-    // Verify password
-    const valid = await verifyPassword(password, client.password_hash);
+    const valid = verifyPassword(password, account.password_hash);
     if (!valid) {
       const content = html`
         <div class="auth-container">
@@ -217,52 +203,45 @@ webRoutes.post('/login', async (c) => {
       return c.html(layout('Login', content));
     }
   }
-  
-  const session = await db.createSession(c.env.DB, client.id);
+
+  const session = db.createSession(c.env.db, account.id);
   setCookie(c, 'session', session.id, { path: '/', httpOnly: true, sameSite: 'Lax' });
   return c.redirect('/dashboard');
 });
 
-// Logout
-webRoutes.post('/logout', async (c) => {
+webRoutes.post('/logout', (c) => {
   const sessionId = getCookie(c, 'session');
-  if (sessionId) {
-    await db.deleteSession(c.env.DB, sessionId);
-  }
+  if (sessionId) db.deleteSession(c.env.db, sessionId);
   deleteCookie(c, 'session');
-  return c.redirect('/login');
+  return redirect('/login');
 });
 
-// Dashboard
-webRoutes.get('/dashboard', async (c) => {
-  const clientId = await getSessionClient(c);
-  if (!clientId) return redirect('/login');
-  
-  const client = await db.getClientById(c.env.DB, clientId);
-  const secrets = await db.listSecrets(c.env.DB, clientId);
-  const agents = await db.listAgents(c.env.DB, clientId);
-  const activity = await db.listAudit(c.env.DB, clientId, 5);
-  
+webRoutes.get('/dashboard', (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
+
+  const account = db.getAccountById(c.env.db, accountId);
+  const secrets = db.listSecrets(c.env.db, accountId);
+  const agents = db.listAgents(c.env.db, accountId);
+  const actuators = db.listActuatorsByAccount(c.env.db, accountId);
+
   const content = html`
     <main>
       <div class="container">
-        <h1>Welcome${client?.name ? `, ${client.name}` : ''}</h1>
+        <h1>Welcome${account?.name ? `, ${account.name}` : ''}</h1>
         <div class="stats">
-          <div class="stat">
-            <div class="stat-value">${secrets.length}</div>
-            <div class="stat-label">Secrets</div>
-          </div>
-          <div class="stat">
-            <div class="stat-value">${agents.length}</div>
-            <div class="stat-label">Agents</div>
-          </div>
+          <div class="stat"><div class="stat-value">${secrets.length}</div><div class="stat-label">Secrets</div></div>
+          <div class="stat"><div class="stat-value">${agents.length}</div><div class="stat-label">Agents</div></div>
+          <div class="stat"><div class="stat-value">${actuators.length}</div><div class="stat-label">Actuators</div></div>
+          <div class="stat"><div class="stat-value">${actuators.filter(a => a.status === 'online').length}</div><div class="stat-label">Online</div></div>
         </div>
         <div class="card">
           <h2>Quick Start</h2>
           <ol style="padding-left: 1.5rem; color: var(--text-muted);">
             <li style="margin-bottom: 0.5rem;"><strong style="color: var(--text);">Add your API keys</strong> — Go to <a href="/secrets">Secrets</a></li>
             <li style="margin-bottom: 0.5rem;"><strong style="color: var(--text);">Create an agent</strong> — Go to <a href="/agents">Agents</a></li>
-            <li><strong style="color: var(--text);">Use the API</strong> — Your agent can now access secrets</li>
+            <li style="margin-bottom: 0.5rem;"><strong style="color: var(--text);">Register actuators</strong> — Go to <a href="/actuators">Actuators</a></li>
+            <li><strong style="color: var(--text);">Use the API</strong> — Your agent can now access secrets and command actuators</li>
           </ol>
         </div>
       </div>
@@ -271,26 +250,25 @@ webRoutes.get('/dashboard', async (c) => {
   return c.html(layout('Dashboard', content, navBar('dashboard')));
 });
 
-// Secrets list
-webRoutes.get('/secrets', async (c) => {
-  const clientId = await getSessionClient(c);
-  if (!clientId) return redirect('/login');
-  
-  const secrets = await db.listSecrets(c.env.DB, clientId);
-  const agents = await db.listAgents(c.env.DB, clientId);
+// ─── Secrets ───────────────────────────────────────────────────────────────────
+
+webRoutes.get('/secrets', (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
+
+  const secrets = db.listSecrets(c.env.db, accountId);
+  const agents = db.listAgents(c.env.db, accountId);
   const agentMap = new Map(agents.map(a => [a.id, a.name]));
-  
-  // Get access info for each secret
-  const secretsWithAccess = await Promise.all(secrets.map(async s => {
-    const access = await db.getSecretAccess(c.env.DB, s.id);
+
+  const secretsWithAccess = secrets.map(s => {
+    const access = db.getSecretAccess(c.env.db, s.id);
     return { ...s, access };
-  }));
-  
+  });
+
   const rows = raw(secretsWithAccess.map(s => {
-    const accessBadge = s.access.length === 0 
+    const accessBadge = s.access.length === 0
       ? html`<span class="badge badge-success">All agents</span>`
       : html`<span class="badge badge-muted">${s.access.map(a => agentMap.get(a.agent_id) || 'Unknown').join(', ')}</span>`;
-    
     return html`
       <tr>
         <td><code class="token">${s.name}</code></td>
@@ -309,7 +287,7 @@ webRoutes.get('/secrets', async (c) => {
       </tr>
     `;
   }).join(''));
-  
+
   const content = html`
     <main>
       <div class="container">
@@ -319,10 +297,7 @@ webRoutes.get('/secrets', async (c) => {
         </div>
         <div class="card">
           ${secrets.length === 0 ? html`
-            <div class="empty">
-              <p>No secrets configured yet</p>
-              <a href="/secrets/add" class="btn btn-primary mt-2">+ Add Secret</a>
-            </div>
+            <div class="empty"><p>No secrets configured yet</p><a href="/secrets/add" class="btn btn-primary mt-2">+ Add Secret</a></div>
           ` : html`
             <table>
               <thead><tr><th>Name</th><th>Provider</th><th>Access</th><th>Created</th><th></th></tr></thead>
@@ -336,20 +311,19 @@ webRoutes.get('/secrets', async (c) => {
   return c.html(layout('Secrets', content, navBar('secrets')));
 });
 
-// Add secret page
-webRoutes.get('/secrets/add', async (c) => {
-  const clientId = await getSessionClient(c);
-  if (!clientId) return redirect('/login');
-  
-  const agents = await db.listAgents(c.env.DB, clientId);
-  
+webRoutes.get('/secrets/add', (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
+
+  const agents = db.listAgents(c.env.db, accountId);
+
   const agentCheckboxes = agents.length > 0 ? raw(agents.map(a => html`
     <label style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;">
       <input type="checkbox" name="agents" value="${a.id}">
       <span>${a.name}</span>
     </label>
   `).join('')) : html`<p class="text-muted">No agents created yet. <a href="/agents">Create one first.</a></p>`;
-  
+
   const content = html`
     <main>
       <div class="container" style="max-width: 600px;">
@@ -383,7 +357,6 @@ webRoutes.get('/secrets/add', async (c) => {
                 <input type="password" id="value" name="value" required placeholder="sk-..." style="flex: 1;">
                 <button type="button" onclick="toggleSecret()" class="btn btn-ghost" id="toggleBtn">Show</button>
               </div>
-              <small class="text-muted">Will be encrypted before storage</small>
             </div>
             <div class="form-group">
               <label>Agent Access</label>
@@ -396,29 +369,10 @@ webRoutes.get('/secrets/add', async (c) => {
                   ${agentCheckboxes}
                 </div>
               </div>
-              <small class="text-muted">Global secrets are available to all agents. Uncheck to restrict access.</small>
             </div>
             <script>
-              function toggleSecret() {
-                const input = document.getElementById('value');
-                const btn = document.getElementById('toggleBtn');
-                if (input.type === 'password') {
-                  input.type = 'text';
-                  btn.textContent = 'Hide';
-                } else {
-                  input.type = 'password';
-                  btn.textContent = 'Show';
-                }
-              }
-              function toggleAgentSelection() {
-                const global = document.getElementById('globalAccess');
-                const selection = document.getElementById('agentSelection');
-                selection.style.display = global.checked ? 'none' : 'block';
-                // Uncheck all agents when switching to global
-                if (global.checked) {
-                  document.querySelectorAll('input[name="agents"]').forEach(cb => cb.checked = false);
-                }
-              }
+              function toggleSecret() { const i = document.getElementById('value'), b = document.getElementById('toggleBtn'); if (i.type === 'password') { i.type = 'text'; b.textContent = 'Hide'; } else { i.type = 'password'; b.textContent = 'Show'; } }
+              function toggleAgentSelection() { const g = document.getElementById('globalAccess'), s = document.getElementById('agentSelection'); s.style.display = g.checked ? 'none' : 'block'; if (g.checked) document.querySelectorAll('input[name="agents"]').forEach(cb => cb.checked = false); }
             </script>
             <div class="flex gap-2">
               <button type="submit" class="btn btn-primary">Save Secret</button>
@@ -432,84 +386,62 @@ webRoutes.get('/secrets/add', async (c) => {
   return c.html(layout('Add Secret', content, navBar('secrets')));
 });
 
-// Add secret submit
 webRoutes.post('/secrets/add', async (c) => {
-  const clientId = await getSessionClient(c);
-  if (!clientId) return redirect('/login');
-  
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
+
   const body = await c.req.parseBody();
   const name = body.name as string;
   const provider = body.provider as string;
   const value = body.value as string;
-  
-  // Get selected agents (empty array = global)
   let agentIds: string[] = [];
   const agents = body.agents;
-  if (agents) {
-    agentIds = Array.isArray(agents) ? agents as string[] : [agents as string];
-  }
-  
-  const encrypted = await encrypt(value, getMasterKey(c.env));
-  const secret = await db.createSecret(c.env.DB, clientId, name, provider, encrypted);
-  
-  // Set agent access (empty = global)
-  await db.setSecretAccess(c.env.DB, secret.id, agentIds);
-  
+  if (agents) agentIds = Array.isArray(agents) ? agents as string[] : [agents as string];
+
+  const encrypted = encrypt(value, getMasterKey(c.env));
+  const secret = db.createSecret(c.env.db, accountId, name, provider, encrypted);
+  db.setSecretAccess(c.env.db, secret.id, agentIds);
   return redirect('/secrets');
 });
 
-// Delete secret
-webRoutes.post('/secrets/:id/delete', async (c) => {
-  const clientId = await getSessionClient(c);
-  if (!clientId) return redirect('/login');
-  
-  const id = c.req.param('id');
-  await db.deleteSecret(c.env.DB, id, clientId);
+webRoutes.post('/secrets/:id/delete', (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
+  db.deleteSecret(c.env.db, c.req.param('id'), accountId);
   return redirect('/secrets');
 });
 
-// Edit secret page
-webRoutes.get('/secrets/:id/edit', async (c) => {
-  const clientId = await getSessionClient(c);
-  if (!clientId) return redirect('/login');
-  
+webRoutes.get('/secrets/:id/edit', (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
   const id = c.req.param('id');
-  const secret = await db.getSecretById(c.env.DB, id, clientId);
-  
-  if (!secret) {
-    return c.redirect('/secrets');
-  }
-  
-  const agents = await db.listAgents(c.env.DB, clientId);
-  const currentAccess = await db.getSecretAccess(c.env.DB, id);
+  const secret = db.getSecretById(c.env.db, id, accountId);
+  if (!secret) return redirect('/secrets');
+  const agents = db.listAgents(c.env.db, accountId);
+  const currentAccess = db.getSecretAccess(c.env.db, id);
   const currentAgentIds = new Set(currentAccess.map(a => a.agent_id));
   const isGlobal = currentAccess.length === 0;
-  
+
   const providers = [
-    { value: 'anthropic', label: 'Anthropic (Claude)' },
-    { value: 'openai', label: 'OpenAI' },
-    { value: 'google', label: 'Google AI / Gemini' },
-    { value: 'aws', label: 'AWS' },
-    { value: 'github', label: 'GitHub' },
-    { value: 'cloudflare', label: 'Cloudflare' },
-    { value: 'notion', label: 'Notion' },
-    { value: 'brave', label: 'Brave Search' },
-    { value: 'elevenlabs', label: 'ElevenLabs' },
-    { value: 'doppler', label: 'Doppler' },
+    { value: 'anthropic', label: 'Anthropic (Claude)' }, { value: 'openai', label: 'OpenAI' },
+    { value: 'google', label: 'Google AI / Gemini' }, { value: 'aws', label: 'AWS' },
+    { value: 'github', label: 'GitHub' }, { value: 'cloudflare', label: 'Cloudflare' },
+    { value: 'notion', label: 'Notion' }, { value: 'brave', label: 'Brave Search' },
+    { value: 'elevenlabs', label: 'ElevenLabs' }, { value: 'doppler', label: 'Doppler' },
     { value: 'other', label: 'Other' },
   ];
-  
-  const providerOptions = raw(providers.map(p => 
+
+  const providerOptions = raw(providers.map(p =>
     `<option value="${p.value}"${p.value === secret.provider ? ' selected' : ''}>${p.label}</option>`
   ).join(''));
-  
+
   const agentCheckboxes = agents.length > 0 ? raw(agents.map(a => html`
     <label style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;">
       <input type="checkbox" name="agents" value="${a.id}" ${currentAgentIds.has(a.id) ? 'checked' : ''}>
       <span>${a.name}</span>
     </label>
   `).join('')) : html`<p class="text-muted">No agents created yet.</p>`;
-  
+
   const content = html`
     <main>
       <div class="container" style="max-width: 600px;">
@@ -522,9 +454,7 @@ webRoutes.get('/secrets/:id/edit', async (c) => {
             </div>
             <div class="form-group">
               <label for="provider">Provider</label>
-              <select id="provider" name="provider" required>
-                ${providerOptions}
-              </select>
+              <select id="provider" name="provider" required>${providerOptions}</select>
             </div>
             <div class="form-group">
               <label for="value">New Secret Value <span class="text-muted">(leave blank to keep current)</span></label>
@@ -553,102 +483,53 @@ webRoutes.get('/secrets/:id/edit', async (c) => {
         </div>
       </div>
       <script>
-        function toggleSecret() {
-          const input = document.getElementById('value');
-          const btn = document.getElementById('toggleBtn');
-          if (input.type === 'password') {
-            input.type = 'text';
-            btn.textContent = 'Hide';
-          } else {
-            input.type = 'password';
-            btn.textContent = 'Show';
-          }
-        }
-        function toggleAgentSelection() {
-          const global = document.getElementById('globalAccess');
-          const selection = document.getElementById('agentSelection');
-          selection.style.display = global.checked ? 'none' : 'block';
-          if (global.checked) {
-            document.querySelectorAll('input[name="agents"]').forEach(cb => cb.checked = false);
-          }
-        }
+        function toggleSecret() { const i = document.getElementById('value'), b = document.getElementById('toggleBtn'); if (i.type === 'password') { i.type = 'text'; b.textContent = 'Hide'; } else { i.type = 'password'; b.textContent = 'Show'; } }
+        function toggleAgentSelection() { const g = document.getElementById('globalAccess'), s = document.getElementById('agentSelection'); s.style.display = g.checked ? 'none' : 'block'; if (g.checked) document.querySelectorAll('input[name="agents"]').forEach(cb => cb.checked = false); }
       </script>
     </main>
   `;
   return c.html(layout('Edit Secret', content, navBar('secrets')));
 });
 
-// Edit secret submit
 webRoutes.post('/secrets/:id/edit', async (c) => {
-  const clientId = await getSessionClient(c);
-  if (!clientId) return redirect('/login');
-  
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
   const id = c.req.param('id');
   const body = await c.req.parseBody();
   const name = body.name as string;
   const provider = body.provider as string;
   const value = body.value as string;
-  
-  // Get selected agents (empty array = global)
   let agentIds: string[] = [];
   const agents = body.agents;
-  if (agents) {
-    agentIds = Array.isArray(agents) ? agents as string[] : [agents as string];
-  }
-  
-  // Only encrypt new value if provided
+  if (agents) agentIds = Array.isArray(agents) ? agents as string[] : [agents as string];
+
   let encryptedValue: string | undefined;
-  if (value && value.trim()) {
-    encryptedValue = await encrypt(value, getMasterKey(c.env));
-  }
-  
-  await db.updateSecret(c.env.DB, id, clientId, name, provider, encryptedValue);
-  
-  // Update agent access
-  await db.setSecretAccess(c.env.DB, id, agentIds);
-  
-  return c.redirect('/secrets');
+  if (value && value.trim()) encryptedValue = encrypt(value, getMasterKey(c.env));
+
+  db.updateSecret(c.env.db, id, accountId, name, provider, encryptedValue);
+  db.setSecretAccess(c.env.db, id, agentIds);
+  return redirect('/secrets');
 });
 
-// Reveal secret value
-webRoutes.get('/secrets/:id/reveal', async (c) => {
-  const clientId = await getSessionClient(c);
-  if (!clientId) return redirect('/login');
-  
+webRoutes.get('/secrets/:id/reveal', (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
   const id = c.req.param('id');
-  const secret = await db.getSecretById(c.env.DB, id, clientId);
-  
-  if (!secret) {
-    return c.redirect('/secrets');
-  }
-  
+  const secret = db.getSecretById(c.env.db, id, accountId);
+  if (!secret) return redirect('/secrets');
+
   let value: string;
-  try {
-    const { decrypt } = await import('./crypto');
-    value = await decrypt(secret.encrypted_value, getMasterKey(c.env));
-  } catch (e) {
-    value = '[decryption failed]';
-  }
-  
+  try { value = decrypt(secret.encrypted_value, getMasterKey(c.env)); }
+  catch { value = '[decryption failed]'; }
+
   const content = html`
     <main>
       <div class="container" style="max-width: 600px;">
         <h1>Secret: ${secret.name}</h1>
         <div class="card">
-          <div class="form-group">
-            <label>Provider</label>
-            <div class="text-muted">${secret.provider}</div>
-          </div>
-          <div class="form-group">
-            <label>Value</label>
-            <div style="background: var(--bg-tertiary); padding: 1rem; border-radius: 0.375rem; font-family: monospace; word-break: break-all;">
-              ${value}
-            </div>
-          </div>
-          <div class="form-group">
-            <label>Created</label>
-            <div class="text-muted">${secret.created_at}</div>
-          </div>
+          <div class="form-group"><label>Provider</label><div class="text-muted">${secret.provider}</div></div>
+          <div class="form-group"><label>Value</label><div style="background: var(--bg-tertiary); padding: 1rem; border-radius: 0.375rem; font-family: monospace; word-break: break-all;">${value}</div></div>
+          <div class="form-group"><label>Created</label><div class="text-muted">${secret.created_at}</div></div>
           <a href="/secrets" class="btn btn-ghost">← Back to Secrets</a>
         </div>
       </div>
@@ -657,21 +538,20 @@ webRoutes.get('/secrets/:id/reveal', async (c) => {
   return c.html(layout('Secret Details', content, navBar('secrets')));
 });
 
-// Agents list
-webRoutes.get('/agents', async (c) => {
-  const clientId = await getSessionClient(c);
-  if (!clientId) return redirect('/login');
-  
-  const agents = await db.listAgents(c.env.DB, clientId);
-  
+// ─── Agents ────────────────────────────────────────────────────────────────────
+
+webRoutes.get('/agents', (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
+
+  const agents = db.listAgents(c.env.db, accountId);
+
+  // Note: with token_hash, we can't show plaintext tokens for existing agents.
+  // Only at creation time. We show the hash prefix as identifier.
   const rows = raw(agents.map(a => html`
     <tr>
       <td><strong>${a.name}</strong></td>
-      <td>
-        <code class="token">${a.token.slice(0, 16)}...${a.token.slice(-4)}</code>
-        <button type="button" class="btn btn-ghost btn-sm" style="margin-left: 0.5rem; padding: 0.25rem 0.5rem;" 
-                onclick="copyToken('${a.token}', this)">Copy</button>
-      </td>
+      <td><code class="token">${a.token_hash.slice(0, 16)}...</code></td>
       <td class="text-muted">${a.created_at.split('T')[0]}</td>
       <td class="text-muted">${a.last_seen_at?.split('T')[0] || 'Never'}</td>
       <td>
@@ -684,7 +564,7 @@ webRoutes.get('/agents', async (c) => {
       </td>
     </tr>
   `).join(''));
-  
+
   const content = html`
     <main>
       <div class="container">
@@ -698,86 +578,73 @@ webRoutes.get('/agents', async (c) => {
         </div>
         <div class="card">
           <h3>Your Agents</h3>
-          ${agents.length === 0 ? html`
-            <div class="empty"><p>No agents created yet</p></div>
-          ` : html`
+          ${agents.length === 0 ? html`<div class="empty"><p>No agents created yet</p></div>` : html`
             <table>
-              <thead><tr><th>Name</th><th>Token</th><th>Created</th><th>Last Seen</th><th></th></tr></thead>
+              <thead><tr><th>Name</th><th>Token Hash</th><th>Created</th><th>Last Seen</th><th></th></tr></thead>
               <tbody>${rows}</tbody>
             </table>
           `}
         </div>
-        <div class="card">
-          <h3>API Usage</h3>
-          <pre style="background: var(--bg-tertiary); padding: 1rem; border-radius: 0.375rem; overflow-x: auto;"><code>curl -X POST https://your-broker.workers.dev/v1/secrets/list \\
-  -H "Authorization: Bearer seks_agent_..." \\
-  -H "Content-Type: application/json"</code></pre>
-        </div>
       </div>
-      <script>
-        function copyToken(token, btn) {
-          navigator.clipboard.writeText(token).then(() => {
-            const orig = btn.textContent;
-            btn.textContent = 'Copied!';
-            btn.style.color = 'var(--accent)';
-            setTimeout(() => {
-              btn.textContent = orig;
-              btn.style.color = '';
-            }, 1500);
-          });
-        }
-      </script>
     </main>
   `;
   return c.html(layout('Agents', content, navBar('agents')));
 });
 
-// Add agent
 webRoutes.post('/agents/add', async (c) => {
-  const clientId = await getSessionClient(c);
-  if (!clientId) return redirect('/login');
-  
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
   const body = await c.req.parseBody();
   const name = body.name as string;
-  
-  await db.createAgent(c.env.DB, clientId, name);
+
+  const agent = db.createAgent(c.env.db, accountId, name);
+
+  // Show the plaintext token once
+  const content = html`
+    <main>
+      <div class="container" style="max-width: 600px;">
+        <h1>Agent Created: ${name}</h1>
+        <div class="alert" style="background: rgba(34, 197, 94, 0.1); border: 1px solid var(--accent); color: var(--accent);">
+          ⚠️ Save this token now! It will never be shown again.
+        </div>
+        <div class="card">
+          <label>Agent Token</label>
+          <div style="background: var(--bg-tertiary); padding: 1rem; border-radius: 0.375rem; font-family: monospace; word-break: break-all; margin-top: 0.5rem;">
+            ${agent._plaintext_token}
+          </div>
+          <button type="button" class="btn btn-ghost btn-sm mt-2" onclick="navigator.clipboard.writeText('${agent._plaintext_token}').then(() => this.textContent = 'Copied!')">Copy Token</button>
+        </div>
+        <a href="/agents" class="btn btn-primary mt-2">← Back to Agents</a>
+      </div>
+    </main>
+  `;
+  return c.html(layout('Agent Created', content, navBar('agents')));
+});
+
+webRoutes.post('/agents/:id/delete', (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
+  db.deleteAgent(c.env.db, c.req.param('id'), accountId);
   return redirect('/agents');
 });
 
-// Delete agent
-webRoutes.post('/agents/:id/delete', async (c) => {
-  const clientId = await getSessionClient(c);
-  if (!clientId) return redirect('/login');
-  
+webRoutes.get('/agents/:id', (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
   const id = c.req.param('id');
-  await db.deleteAgent(c.env.DB, id, clientId);
-  return redirect('/agents');
-});
-
-// Agent detail page (proxy tokens)
-webRoutes.get('/agents/:id', async (c) => {
-  const clientId = await getSessionClient(c);
-  if (!clientId) return redirect('/login');
-  
-  const id = c.req.param('id');
-  const agents = await db.listAgents(c.env.DB, clientId);
+  const agents = db.listAgents(c.env.db, accountId);
   const agent = agents.find(a => a.id === id);
-  
-  if (!agent) {
-    return c.redirect('/agents');
-  }
-  
-  const fakeTokens = await db.listFakeTokens(c.env.DB, id);
-  
+  if (!agent) return redirect('/agents');
+
+  const fakeTokens = db.listFakeTokens(c.env.db, id);
   const providers = ['openai', 'anthropic', 'github', 'notion', 'gemini', 'cloudflare', 'brave', 'aws'];
-  
+
   const tokenRows = raw(fakeTokens.map(t => html`
     <tr>
       <td><strong>${t.provider}</strong></td>
       <td>
         <code class="token">${t.token}</code>
-        <button type="button" class="btn btn-ghost btn-sm" style="margin-left: 0.5rem; padding: 0.25rem 0.5rem;" 
-                onclick="copyToken('${t.token}', this)">Copy</button>
+        <button type="button" class="btn btn-ghost btn-sm" style="margin-left: 0.5rem; padding: 0.25rem 0.5rem;" onclick="copyToken('${t.token}', this)">Copy</button>
       </td>
       <td class="text-muted">${t.created_at.split('T')[0]}</td>
       <td class="text-muted">${t.last_used_at?.split('T')[0] || 'Never'}</td>
@@ -788,10 +655,10 @@ webRoutes.get('/agents/:id', async (c) => {
       </td>
     </tr>
   `).join(''));
-  
+
   const existingProviders = new Set(fakeTokens.map(t => t.provider));
   const availableProviders = providers.filter(p => !existingProviders.has(p));
-  
+
   const content = html`
     <main>
       <div class="container">
@@ -799,29 +666,15 @@ webRoutes.get('/agents/:id', async (c) => {
           <h1>Agent: ${agent.name}</h1>
           <a href="/agents" class="btn btn-ghost">← Back</a>
         </div>
-        
-        <div class="card">
-          <h3>Agent Token</h3>
-          <p class="text-muted mb-2">Use this token for direct API access (secrets, list, etc.)</p>
-          <div class="flex gap-2 items-center">
-            <code class="token" style="padding: 0.5rem;">${agent.token}</code>
-            <button type="button" class="btn btn-ghost btn-sm" onclick="copyToken('${agent.token}', this)">Copy</button>
-          </div>
-        </div>
-        
         <div class="card">
           <h3>Proxy Tokens</h3>
-          <p class="text-muted mb-2">Use these tokens with the passthrough proxy. Each token works only for its provider.</p>
-          
-          ${fakeTokens.length === 0 ? html`
-            <div class="empty"><p>No proxy tokens generated yet</p></div>
-          ` : html`
+          <p class="text-muted mb-2">Use these tokens with the passthrough proxy.</p>
+          ${fakeTokens.length === 0 ? html`<div class="empty"><p>No proxy tokens generated yet</p></div>` : html`
             <table>
               <thead><tr><th>Provider</th><th>Token</th><th>Created</th><th>Last Used</th><th></th></tr></thead>
               <tbody>${tokenRows}</tbody>
             </table>
           `}
-          
           ${availableProviders.length > 0 ? html`
             <div style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--border);">
               <h4>Generate New Token</h4>
@@ -834,92 +687,270 @@ webRoutes.get('/agents/:id', async (c) => {
             </div>
           ` : ''}
         </div>
-        
-        <div class="card">
-          <h3>Usage Examples</h3>
-          <pre style="background: var(--bg-tertiary); padding: 1rem; border-radius: 0.375rem; overflow-x: auto;"><code># OpenAI via proxy (Python)
-from openai import OpenAI
-client = OpenAI(
-    api_key="seks_openai_...",
-    base_url="https://seks-broker.stcredzero.workers.dev/api/openai"
-)
-
-# GitHub via proxy (curl)
-curl https://seks-broker.stcredzero.workers.dev/api/github/user \\
-  -H "Authorization: Bearer seks_github_..."
-
-# AWS S3 via proxy (curl)
-# URL format: /api/aws/s3/&lt;region&gt;/&lt;bucket&gt;/&lt;key&gt;
-curl https://seks-broker.stcredzero.workers.dev/api/aws/s3/us-west-2/my-bucket/my-file.txt \\
-  -H "Authorization: Bearer seks_aws_..."
-
-# Brave Search
-curl "https://seks-broker.stcredzero.workers.dev/api/brave/res/v1/web/search?q=test" \\
-  -H "Authorization: Bearer seks_brave_..."</code></pre>
-        </div>
       </div>
       <script>
-        function copyToken(token, btn) {
-          navigator.clipboard.writeText(token).then(() => {
-            const orig = btn.textContent;
-            btn.textContent = 'Copied!';
-            btn.style.color = 'var(--accent)';
-            setTimeout(() => {
-              btn.textContent = orig;
-              btn.style.color = '';
-            }, 1500);
-          });
-        }
+        function copyToken(token, btn) { navigator.clipboard.writeText(token).then(() => { const o = btn.textContent; btn.textContent = 'Copied!'; btn.style.color = 'var(--accent)'; setTimeout(() => { btn.textContent = o; btn.style.color = ''; }, 1500); }); }
       </script>
     </main>
   `;
   return c.html(layout(`Agent: ${agent.name}`, content, navBar('agents')));
 });
 
-// Generate fake token
 webRoutes.post('/agents/:id/tokens', async (c) => {
-  const clientId = await getSessionClient(c);
-  if (!clientId) return redirect('/login');
-  
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
   const id = c.req.param('id');
   const body = await c.req.parseBody();
   const provider = body.provider as string;
-  
-  // Verify agent belongs to this client
-  const agents = await db.listAgents(c.env.DB, clientId);
-  if (!agents.find(a => a.id === id)) {
-    return redirect('/agents');
-  }
-  
-  await db.createFakeToken(c.env.DB, id, provider);
-  return c.redirect(`/agents/${id}`);
+  const agents = db.listAgents(c.env.db, accountId);
+  if (!agents.find(a => a.id === id)) return redirect('/agents');
+  db.createFakeToken(c.env.db, id, provider);
+  return redirect(`/agents/${id}`);
 });
 
-// Renew fake token
-webRoutes.post('/agents/:id/tokens/:provider/renew', async (c) => {
-  const clientId = await getSessionClient(c);
-  if (!clientId) return redirect('/login');
-  
+webRoutes.post('/agents/:id/tokens/:provider/renew', (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
   const id = c.req.param('id');
   const provider = c.req.param('provider');
-  
-  // Verify agent belongs to this client
-  const agents = await db.listAgents(c.env.DB, clientId);
-  if (!agents.find(a => a.id === id)) {
-    return redirect('/agents');
-  }
-  
-  await db.createFakeToken(c.env.DB, id, provider);
-  return c.redirect(`/agents/${id}`);
+  const agents = db.listAgents(c.env.db, accountId);
+  if (!agents.find(a => a.id === id)) return redirect('/agents');
+  db.createFakeToken(c.env.db, id, provider);
+  return redirect(`/agents/${id}`);
 });
 
-// Activity log
-webRoutes.get('/activity', async (c) => {
-  const clientId = await getSessionClient(c);
-  if (!clientId) return redirect('/login');
-  
-  const entries = await db.listAudit(c.env.DB, clientId, 100);
-  
+// ─── Actuators ─────────────────────────────────────────────────────────────────
+
+webRoutes.get('/actuators', (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
+
+  const agents = db.listAgents(c.env.db, accountId);
+  const agentMap = new Map(agents.map(a => [a.id, a.name]));
+  const actuators = db.listActuatorsByAccount(c.env.db, accountId);
+
+  const rows = raw(actuators.map(a => {
+    const caps = db.listCapabilities(c.env.db, a.id);
+    const statusBadge = a.status === 'online'
+      ? html`<span class="badge badge-success">online</span>`
+      : a.status === 'suspended'
+      ? html`<span class="badge badge-danger">suspended</span>`
+      : html`<span class="badge badge-muted">offline</span>`;
+    return html`
+      <tr>
+        <td><strong>${a.name}</strong></td>
+        <td class="text-muted">${agentMap.get(a.agent_id) || 'Unknown'}</td>
+        <td>${a.type}</td>
+        <td>${statusBadge}</td>
+        <td>${caps.length > 0 ? caps.map(c => html`<span class="badge badge-muted" style="margin-right: 0.25rem;">${c.capability}</span>`).join('') : html`<span class="text-muted">none</span>`}</td>
+        <td class="text-muted">${a.last_seen_at?.replace('T', ' ').split('.')[0] || 'Never'}</td>
+        <td>
+          <div class="flex gap-2">
+            <a href="/actuators/${a.id}" class="btn btn-ghost btn-sm">Manage</a>
+            <form method="POST" action="/actuators/${a.id}/delete" onsubmit="return confirm('Delete this actuator?');" style="margin: 0;">
+              <button type="submit" class="btn btn-danger btn-sm">Delete</button>
+            </form>
+          </div>
+        </td>
+      </tr>
+    `;
+  }).join(''));
+
+  const content = html`
+    <main>
+      <div class="container">
+        <div class="flex justify-between items-center mb-2">
+          <h1>Actuators</h1>
+        </div>
+        <div class="card">
+          <h3>Register Actuator</h3>
+          <form method="POST" action="/actuators/add" class="flex gap-2">
+            <input type="text" name="name" placeholder="Actuator name" required style="flex: 2;">
+            <select name="agent_id" required style="flex: 1;">
+              ${raw(agents.map(a => `<option value="${a.id}">${a.name}</option>`).join(''))}
+            </select>
+            <select name="type" style="flex: 1;">
+              <option value="vps">VPS</option>
+              <option value="desktop">Desktop</option>
+              <option value="mobile">Mobile</option>
+            </select>
+            <button type="submit" class="btn btn-primary">Register</button>
+          </form>
+        </div>
+        <div class="card">
+          ${actuators.length === 0 ? html`<div class="empty"><p>No actuators registered yet</p></div>` : html`
+            <table>
+              <thead><tr><th>Name</th><th>Agent</th><th>Type</th><th>Status</th><th>Capabilities</th><th>Last Seen</th><th></th></tr></thead>
+              <tbody>${rows}</tbody>
+            </table>
+          `}
+        </div>
+      </div>
+    </main>
+  `;
+  return c.html(layout('Actuators', content, navBar('actuators')));
+});
+
+webRoutes.post('/actuators/add', async (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
+  const body = await c.req.parseBody();
+  const name = body.name as string;
+  const agentId = body.agent_id as string;
+  const type = body.type as string || 'vps';
+
+  // Verify agent belongs to this account
+  const agents = db.listAgents(c.env.db, accountId);
+  if (!agents.find(a => a.id === agentId)) return redirect('/actuators');
+
+  db.createActuator(c.env.db, agentId, name, type);
+  return redirect('/actuators');
+});
+
+webRoutes.get('/actuators/:id', (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
+  const id = c.req.param('id');
+  const actuator = db.getActuatorById(c.env.db, id);
+  if (!actuator) return redirect('/actuators');
+
+  // Verify ownership
+  const agent = db.getAgentById(c.env.db, actuator.agent_id);
+  if (!agent || agent.account_id !== accountId) return redirect('/actuators');
+
+  const caps = db.listCapabilities(c.env.db, id);
+  const commands = db.listRecentCommands(c.env.db, actuator.agent_id, 20);
+  const actuatorCommands = commands.filter(cmd => cmd.actuator_id === id || cmd.actuator_id === null);
+
+  const allCaps = ['git', 'docker', 'filesystem', 'shell', 'network', 'credential', 'admin'];
+  const existingCaps = new Set(caps.map(c => c.capability));
+  const availableCaps = allCaps.filter(c => !existingCaps.has(c));
+
+  const capRows = raw(caps.map(cap => html`
+    <tr>
+      <td><code class="token">${cap.capability}</code></td>
+      <td class="text-muted">${cap.constraints || 'none'}</td>
+      <td>
+        <form method="POST" action="/actuators/${id}/capabilities/${cap.capability}/delete" style="margin: 0;">
+          <button type="submit" class="btn btn-danger btn-sm">Remove</button>
+        </form>
+      </td>
+    </tr>
+  `).join(''));
+
+  const cmdRows = raw(actuatorCommands.map(cmd => {
+    const statusBadge = cmd.status === 'completed' ? 'badge-success'
+      : cmd.status === 'failed' ? 'badge-danger'
+      : cmd.status === 'delivered' ? 'badge-warning'
+      : 'badge-muted';
+    return html`
+      <tr>
+        <td class="text-muted">${cmd.created_at.replace('T', ' ').split('.')[0]}</td>
+        <td><code class="token">${cmd.capability}</code></td>
+        <td><span class="badge ${statusBadge}">${cmd.status}</span></td>
+        <td class="text-muted">${cmd.completed_at ? cmd.completed_at.replace('T', ' ').split('.')[0] : '-'}</td>
+      </tr>
+    `;
+  }).join(''));
+
+  const content = html`
+    <main>
+      <div class="container">
+        <div class="flex justify-between items-center mb-2">
+          <h1>Actuator: ${actuator.name}</h1>
+          <a href="/actuators" class="btn btn-ghost">← Back</a>
+        </div>
+        <div class="card">
+          <h3>Details</h3>
+          <p><strong>ID:</strong> <code class="token">${actuator.id}</code></p>
+          <p><strong>Type:</strong> ${actuator.type}</p>
+          <p><strong>Status:</strong> <span class="badge ${actuator.status === 'online' ? 'badge-success' : 'badge-muted'}">${actuator.status}</span></p>
+          <p><strong>Agent:</strong> ${agent.name}</p>
+          <p><strong>Last Seen:</strong> ${actuator.last_seen_at || 'Never'}</p>
+        </div>
+        <div class="card">
+          <h3>Capabilities</h3>
+          ${caps.length > 0 ? html`
+            <table>
+              <thead><tr><th>Capability</th><th>Constraints</th><th></th></tr></thead>
+              <tbody>${capRows}</tbody>
+            </table>
+          ` : html`<p class="text-muted">No capabilities assigned</p>`}
+          ${availableCaps.length > 0 ? html`
+            <div style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--border);">
+              <form method="POST" action="/actuators/${id}/capabilities" class="flex gap-2">
+                <select name="capability" required style="flex: 1;">
+                  ${raw(availableCaps.map(c => `<option value="${c}">${c}</option>`).join(''))}
+                </select>
+                <input type="text" name="constraints" placeholder="Constraints (JSON, optional)" style="flex: 2;">
+                <button type="submit" class="btn btn-primary btn-sm">Add</button>
+              </form>
+            </div>
+          ` : ''}
+        </div>
+        <div class="card">
+          <h3>Recent Commands</h3>
+          ${actuatorCommands.length > 0 ? html`
+            <table>
+              <thead><tr><th>Time</th><th>Capability</th><th>Status</th><th>Completed</th></tr></thead>
+              <tbody>${cmdRows}</tbody>
+            </table>
+          ` : html`<p class="text-muted">No commands yet</p>`}
+        </div>
+      </div>
+    </main>
+  `;
+  return c.html(layout(`Actuator: ${actuator.name}`, content, navBar('actuators')));
+});
+
+webRoutes.post('/actuators/:id/delete', (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
+  const id = c.req.param('id');
+  const actuator = db.getActuatorById(c.env.db, id);
+  if (!actuator) return redirect('/actuators');
+  const agent = db.getAgentById(c.env.db, actuator.agent_id);
+  if (!agent || agent.account_id !== accountId) return redirect('/actuators');
+  db.deleteActuator(c.env.db, id);
+  return redirect('/actuators');
+});
+
+webRoutes.post('/actuators/:id/capabilities', async (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
+  const id = c.req.param('id');
+  const body = await c.req.parseBody();
+  const capability = body.capability as string;
+  const constraints = body.constraints as string || undefined;
+  const actuator = db.getActuatorById(c.env.db, id);
+  if (!actuator) return redirect('/actuators');
+  const agent = db.getAgentById(c.env.db, actuator.agent_id);
+  if (!agent || agent.account_id !== accountId) return redirect('/actuators');
+  db.addCapability(c.env.db, id, capability, constraints);
+  return redirect(`/actuators/${id}`);
+});
+
+webRoutes.post('/actuators/:id/capabilities/:cap/delete', (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
+  const id = c.req.param('id');
+  const cap = c.req.param('cap');
+  const actuator = db.getActuatorById(c.env.db, id);
+  if (!actuator) return redirect('/actuators');
+  const agent = db.getAgentById(c.env.db, actuator.agent_id);
+  if (!agent || agent.account_id !== accountId) return redirect('/actuators');
+  db.removeCapability(c.env.db, id, cap);
+  return redirect(`/actuators/${id}`);
+});
+
+// ─── Activity ──────────────────────────────────────────────────────────────────
+
+webRoutes.get('/activity', (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
+
+  const entries = db.listAudit(c.env.db, accountId, 100);
+
   const rows = raw(entries.map(e => html`
     <tr>
       <td class="text-muted">${e.created_at.replace('T', ' ').split('.')[0]}</td>
@@ -929,15 +960,13 @@ webRoutes.get('/activity', async (c) => {
       <td><span class="badge ${e.status === 'success' ? 'badge-success' : 'badge-muted'}">${e.status}</span></td>
     </tr>
   `).join(''));
-  
+
   const content = html`
     <main>
       <div class="container">
         <h1>Activity Log</h1>
         <div class="card">
-          ${entries.length === 0 ? html`
-            <div class="empty"><p>No activity recorded yet</p></div>
-          ` : html`
+          ${entries.length === 0 ? html`<div class="empty"><p>No activity recorded yet</p></div>` : html`
             <table>
               <thead><tr><th>Time</th><th>Agent</th><th>Action</th><th>Resource</th><th>Status</th></tr></thead>
               <tbody>${rows}</tbody>

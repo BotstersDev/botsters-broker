@@ -1,25 +1,27 @@
 {
   "name": "seks-broker",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Cloud-native secret management for AI agents",
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "start": "node dist/index.js",
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
     "test": "vitest run",
     "test:watch": "vitest",
-    "db:migrate": "wrangler d1 execute seks-broker-db --local --file=./schema.sql",
-    "db:migrate:prod": "wrangler d1 execute seks-broker-db --remote --file=./schema.sql"
+    "db:migrate": "echo 'Schema applied automatically on startup'"
   },
   "dependencies": {
-    "hono": "^4.0.0"
+    "hono": "^4.0.0",
+    "@hono/node-server": "^1.13.0",
+    "better-sqlite3": "^11.0.0",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20240208.0",
-    "@miniflare/d1": "^2.14.4",
-    "miniflare": "^4.20260205.0",
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/ws": "^8.5.12",
+    "tsx": "^4.19.0",
     "typescript": "^5.3.0",
-    "vitest": "^4.0.18",
-    "wrangler": "^3.28.0"
+    "vitest": "^4.0.18"
   }
 }

@@ -1,324 +1,329 @@
 /**
- * Database operations for SEKS Broker
+ * Database operations for SEKS Broker (better-sqlite3)
  */
 
-import { generateId, generateToken } from './crypto';
-import type { Client, Agent, Secret, AuditEntry, Session, Env } from './types';
+import type Database from 'better-sqlite3';
+import { generateId, generateToken, hashToken } from './crypto';
+import type { Account, Agent, Secret, AuditEntry, Session, FakeToken, SecretAccess, Actuator, Capability, Command } from './types';
 
-// ─── Clients ───────────────────────────────────────────────────────────────────
+// ─── Accounts (formerly Clients) ──────────────────────────────────────────────
 
-export async function createClient(
-  db: D1Database,
-  email: string,
-  passwordHash: string,
-  name?: string
-): Promise<Client> {
+export function createAccount(db: Database.Database, email: string, passwordHash: string, name?: string): Account {
   const id = generateId();
   const now = new Date().toISOString();
-  
-  await db.prepare(
-    'INSERT INTO clients (id, email, password_hash, name, created_at) VALUES (?, ?, ?, ?, ?)'
-  ).bind(id, email, passwordHash, name ?? null, now).run();
-  
+  db.prepare(
+    'INSERT INTO accounts (id, email, password_hash, name, created_at) VALUES (?, ?, ?, ?, ?)'
+  ).run(id, email, passwordHash, name ?? null, now);
   return { id, email, password_hash: passwordHash, name: name ?? null, created_at: now };
 }
 
-export async function getClientByEmail(db: D1Database, email: string): Promise<Client | null> {
-  const result = await db.prepare('SELECT * FROM clients WHERE email = ?').bind(email).first<Client>();
-  return result ?? null;
+export function getAccountByEmail(db: Database.Database, email: string): Account | null {
+  return db.prepare('SELECT * FROM accounts WHERE email = ?').get(email) as Account | undefined ?? null;
 }
 
-export async function getClientById(db: D1Database, id: string): Promise<Client | null> {
-  const result = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first<Client>();
-  return result ?? null;
+export function getAccountById(db: Database.Database, id: string): Account | null {
+  return db.prepare('SELECT * FROM accounts WHERE id = ?').get(id) as Account | undefined ?? null;
 }
+
+// Backwards compat aliases
+export const createClient = createAccount;
+export const getClientByEmail = getAccountByEmail;
+export const getClientById = getAccountById;
 
 // ─── Agents ────────────────────────────────────────────────────────────────────
 
-export async function createAgent(
-  db: D1Database,
-  clientId: string,
-  name: string
-): Promise<Agent> {
+export function createAgent(db: Database.Database, accountId: string, name: string): Agent & { _plaintext_token: string } {
   const id = `agent_${generateId().split('-')[0]}`;
-  const token = generateToken('seks_agent');
+  const plaintextToken = generateToken('seks_agent');
+  const tokenHash = hashToken(plaintextToken);
   const now = new Date().toISOString();
-  
-  await db.prepare(
-    'INSERT INTO agents (id, client_id, name, token, scopes, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-  ).bind(id, clientId, name, token, '[]', now).run();
-  
-  return { id, client_id: clientId, name, token, scopes: '[]', created_at: now, last_seen_at: null };
+
+  db.prepare(
+    'INSERT INTO agents (id, account_id, name, token_hash, scopes, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(id, accountId, name, tokenHash, '[]', now);
+
+  return { id, account_id: accountId, name, token_hash: tokenHash, scopes: '[]', created_at: now, last_seen_at: null, _plaintext_token: plaintextToken };
 }
 
-export async function getAgentByToken(db: D1Database, token: string): Promise<Agent | null> {
-  const result = await db.prepare('SELECT * FROM agents WHERE token = ?').bind(token).first<Agent>();
-  return result ?? null;
+export function getAgentByTokenHash(db: Database.Database, tokenHash: string): Agent | null {
+  return db.prepare('SELECT * FROM agents WHERE token_hash = ?').get(tokenHash) as Agent | undefined ?? null;
 }
 
-export async function getAgentById(db: D1Database, id: string): Promise<Agent | null> {
-  const result = await db.prepare('SELECT * FROM agents WHERE id = ?').bind(id).first<Agent>();
-  return result ?? null;
+export function getAgentByToken(db: Database.Database, token: string): Agent | null {
+  const h = hashToken(token);
+  return getAgentByTokenHash(db, h);
 }
 
-export async function listAgents(db: D1Database, clientId: string): Promise<Agent[]> {
-  const result = await db.prepare(
-    'SELECT * FROM agents WHERE client_id = ? ORDER BY created_at DESC'
-  ).bind(clientId).all<Agent>();
-  return result.results ?? [];
+export function getAgentById(db: Database.Database, id: string): Agent | null {
+  return db.prepare('SELECT * FROM agents WHERE id = ?').get(id) as Agent | undefined ?? null;
 }
 
-export async function deleteAgent(db: D1Database, id: string, clientId: string): Promise<void> {
-  await db.prepare('DELETE FROM agents WHERE id = ? AND client_id = ?').bind(id, clientId).run();
+export function listAgents(db: Database.Database, accountId: string): Agent[] {
+  return db.prepare('SELECT * FROM agents WHERE account_id = ? ORDER BY created_at DESC').all(accountId) as Agent[];
 }
 
-export async function updateAgentLastSeen(db: D1Database, id: string): Promise<void> {
+export function deleteAgent(db: Database.Database, id: string, accountId: string): void {
+  db.prepare('DELETE FROM agents WHERE id = ? AND account_id = ?').run(id, accountId);
+}
+
+export function updateAgentLastSeen(db: Database.Database, id: string): void {
   const now = new Date().toISOString();
-  await db.prepare('UPDATE agents SET last_seen_at = ? WHERE id = ?').bind(now, id).run();
+  db.prepare('UPDATE agents SET last_seen_at = ? WHERE id = ?').run(now, id);
 }
 
 // ─── Secrets ───────────────────────────────────────────────────────────────────
 
-export async function createSecret(
-  db: D1Database,
-  clientId: string,
-  name: string,
-  provider: string,
-  encryptedValue: string
-): Promise<Secret> {
+export function createSecret(db: Database.Database, accountId: string, name: string, provider: string, encryptedValue: string): Secret {
   const id = generateId();
   const now = new Date().toISOString();
-  
-  await db.prepare(
-    'INSERT INTO secrets (id, client_id, name, provider, encrypted_value, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-  ).bind(id, clientId, name, provider, encryptedValue, now, now).run();
-  
-  return {
-    id, client_id: clientId, name, provider, encrypted_value: encryptedValue,
-    metadata: null, created_at: now, updated_at: now
-  };
+  db.prepare(
+    'INSERT INTO secrets (id, account_id, name, provider, encrypted_value, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).run(id, accountId, name, provider, encryptedValue, now, now);
+  return { id, account_id: accountId, name, provider, encrypted_value: encryptedValue, metadata: null, created_at: now, updated_at: now };
 }
 
-export async function getSecret(db: D1Database, clientId: string, name: string, agentId?: string): Promise<Secret | null> {
+export function getSecret(db: Database.Database, accountId: string, name: string, agentId?: string): Secret | null {
   if (agentId) {
-    // Agent access: global secrets OR secrets explicitly granted to this agent
-    const result = await db.prepare(`
+    return db.prepare(`
       SELECT s.* FROM secrets s
-      WHERE s.client_id = ? AND s.name = ?
+      WHERE s.account_id = ? AND s.name = ?
         AND (
           NOT EXISTS (SELECT 1 FROM secret_access sa WHERE sa.secret_id = s.id)
           OR EXISTS (SELECT 1 FROM secret_access sa WHERE sa.secret_id = s.id AND sa.agent_id = ?)
         )
-    `).bind(clientId, name, agentId).first<Secret>();
-    return result ?? null;
+    `).get(accountId, name, agentId) as Secret | undefined ?? null;
   }
-  // Admin access: all secrets
-  const result = await db.prepare(
-    'SELECT * FROM secrets WHERE client_id = ? AND name = ?'
-  ).bind(clientId, name).first<Secret>();
-  return result ?? null;
+  return db.prepare('SELECT * FROM secrets WHERE account_id = ? AND name = ?').get(accountId, name) as Secret | undefined ?? null;
 }
 
-export async function listSecrets(db: D1Database, clientId: string, agentId?: string): Promise<Secret[]> {
+export function listSecrets(db: Database.Database, accountId: string, agentId?: string): Secret[] {
   if (agentId) {
-    // Agent access: global secrets OR secrets explicitly granted to this agent
-    const result = await db.prepare(`
+    return db.prepare(`
       SELECT s.* FROM secrets s
-      WHERE s.client_id = ?
+      WHERE s.account_id = ?
         AND (
           NOT EXISTS (SELECT 1 FROM secret_access sa WHERE sa.secret_id = s.id)
           OR EXISTS (SELECT 1 FROM secret_access sa WHERE sa.secret_id = s.id AND sa.agent_id = ?)
         )
       ORDER BY s.name
-    `).bind(clientId, agentId).all<Secret>();
-    return result.results ?? [];
+    `).all(accountId, agentId) as Secret[];
   }
-  // Admin access: all secrets
-  const result = await db.prepare(
-    'SELECT * FROM secrets WHERE client_id = ? ORDER BY name'
-  ).bind(clientId).all<Secret>();
-  return result.results ?? [];
+  return db.prepare('SELECT * FROM secrets WHERE account_id = ? ORDER BY name').all(accountId) as Secret[];
 }
 
-export async function deleteSecret(db: D1Database, id: string, clientId: string): Promise<void> {
-  await db.prepare('DELETE FROM secrets WHERE id = ? AND client_id = ?').bind(id, clientId).run();
+export function deleteSecret(db: Database.Database, id: string, accountId: string): void {
+  db.prepare('DELETE FROM secrets WHERE id = ? AND account_id = ?').run(id, accountId);
 }
 
-export async function getSecretById(db: D1Database, id: string, clientId: string): Promise<Secret | null> {
-  const result = await db.prepare(
-    'SELECT * FROM secrets WHERE id = ? AND client_id = ?'
-  ).bind(id, clientId).first<Secret>();
-  return result ?? null;
+export function getSecretById(db: Database.Database, id: string, accountId: string): Secret | null {
+  return db.prepare('SELECT * FROM secrets WHERE id = ? AND account_id = ?').get(id, accountId) as Secret | undefined ?? null;
 }
 
-export async function updateSecret(
-  db: D1Database,
-  id: string,
-  clientId: string,
-  name: string,
-  provider: string,
-  encryptedValue?: string
-): Promise<void> {
+export function updateSecret(db: Database.Database, id: string, accountId: string, name: string, provider: string, encryptedValue?: string): void {
   const now = new Date().toISOString();
   if (encryptedValue) {
-    await db.prepare(
-      'UPDATE secrets SET name = ?, provider = ?, encrypted_value = ?, updated_at = ? WHERE id = ? AND client_id = ?'
-    ).bind(name, provider, encryptedValue, now, id, clientId).run();
+    db.prepare('UPDATE secrets SET name = ?, provider = ?, encrypted_value = ?, updated_at = ? WHERE id = ? AND account_id = ?')
+      .run(name, provider, encryptedValue, now, id, accountId);
   } else {
-    await db.prepare(
-      'UPDATE secrets SET name = ?, provider = ?, updated_at = ? WHERE id = ? AND client_id = ?'
-    ).bind(name, provider, now, id, clientId).run();
+    db.prepare('UPDATE secrets SET name = ?, provider = ?, updated_at = ? WHERE id = ? AND account_id = ?')
+      .run(name, provider, now, id, accountId);
   }
 }
 
 // ─── Audit Log ─────────────────────────────────────────────────────────────────
 
-export async function logAudit(
-  db: D1Database,
-  clientId: string,
-  agentId: string | null,
-  action: string,
-  resource: string | null,
-  status: string,
-  ipAddress?: string | null,
-  details?: string | null
-): Promise<void> {
+export function logAudit(db: Database.Database, accountId: string, agentId: string | null, action: string, resource: string | null, status: string, ipAddress?: string | null, details?: string | null): void {
   const id = generateId();
   const now = new Date().toISOString();
-  
-  await db.prepare(
-    'INSERT INTO audit_log (id, client_id, agent_id, action, resource, status, ip_address, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-  ).bind(id, clientId, agentId, action, resource, status, ipAddress ?? null, details ?? null, now).run();
+  db.prepare(
+    'INSERT INTO audit_log (id, account_id, agent_id, action, resource, status, ip_address, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(id, accountId, agentId, action, resource, status, ipAddress ?? null, details ?? null, now);
 }
 
-export async function listAudit(db: D1Database, clientId: string, limit: number = 100): Promise<AuditEntry[]> {
-  const result = await db.prepare(
-    'SELECT * FROM audit_log WHERE client_id = ? ORDER BY created_at DESC LIMIT ?'
-  ).bind(clientId, limit).all<AuditEntry>();
-  return result.results ?? [];
+export function listAudit(db: Database.Database, accountId: string, limit: number = 100): AuditEntry[] {
+  return db.prepare('SELECT * FROM audit_log WHERE account_id = ? ORDER BY created_at DESC LIMIT ?').all(accountId, limit) as AuditEntry[];
 }
 
 // ─── Sessions ──────────────────────────────────────────────────────────────────
 
-export async function createSession(db: D1Database, clientId: string): Promise<Session> {
+export function createSession(db: Database.Database, accountId: string): Session {
   const id = generateId();
   const now = new Date();
-  const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000); // 24 hours
-  
-  await db.prepare(
-    'INSERT INTO sessions (id, client_id, expires_at, created_at) VALUES (?, ?, ?, ?)'
-  ).bind(id, clientId, expiresAt.toISOString(), now.toISOString()).run();
-  
-  return { id, client_id: clientId, expires_at: expiresAt.toISOString(), created_at: now.toISOString() };
+  const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+  db.prepare('INSERT INTO sessions (id, account_id, expires_at, created_at) VALUES (?, ?, ?, ?)')
+    .run(id, accountId, expiresAt.toISOString(), now.toISOString());
+  return { id, account_id: accountId, expires_at: expiresAt.toISOString(), created_at: now.toISOString() };
 }
 
-export async function getSession(db: D1Database, id: string): Promise<Session | null> {
-  const result = await db.prepare('SELECT * FROM sessions WHERE id = ?').bind(id).first<Session>();
+export function getSession(db: Database.Database, id: string): Session | null {
+  const result = db.prepare('SELECT * FROM sessions WHERE id = ?').get(id) as Session | undefined;
   if (!result) return null;
-  
-  // Check expiration
   if (new Date(result.expires_at) < new Date()) {
-    await deleteSession(db, id);
+    deleteSession(db, id);
     return null;
   }
-  
   return result;
 }
 
-export async function deleteSession(db: D1Database, id: string): Promise<void> {
-  await db.prepare('DELETE FROM sessions WHERE id = ?').bind(id).run();
+export function deleteSession(db: Database.Database, id: string): void {
+  db.prepare('DELETE FROM sessions WHERE id = ?').run(id);
 }
 
 // ─── Fake Tokens ───────────────────────────────────────────────────────────────
 
-export interface FakeToken {
-  id: string;
-  agent_id: string;
-  provider: string;
-  token: string;
-  created_at: string;
-  last_used_at: string | null;
-}
-
-export async function createFakeToken(
-  db: D1Database,
-  agentId: string,
-  provider: string
-): Promise<FakeToken> {
+export function createFakeToken(db: Database.Database, agentId: string, provider: string): FakeToken {
   const id = generateId();
-  const token = `seks_${provider}_${generateToken('').slice(0, 24)}`; // e.g., seks_openai_abc123...
+  const token = `seks_${provider}_${generateToken('').slice(0, 24)}`;
   const now = new Date().toISOString();
-  
-  // Delete existing token for this agent+provider (upsert behavior)
-  await db.prepare('DELETE FROM fake_tokens WHERE agent_id = ? AND provider = ?')
-    .bind(agentId, provider).run();
-  
-  await db.prepare(
-    'INSERT INTO fake_tokens (id, agent_id, provider, token, created_at) VALUES (?, ?, ?, ?, ?)'
-  ).bind(id, agentId, provider, token, now).run();
-  
+  db.prepare('DELETE FROM fake_tokens WHERE agent_id = ? AND provider = ?').run(agentId, provider);
+  db.prepare('INSERT INTO fake_tokens (id, agent_id, provider, token, created_at) VALUES (?, ?, ?, ?, ?)').run(id, agentId, provider, token, now);
   return { id, agent_id: agentId, provider, token, created_at: now, last_used_at: null };
 }
 
-export async function getFakeTokenByToken(db: D1Database, token: string): Promise<FakeToken | null> {
-  const result = await db.prepare('SELECT * FROM fake_tokens WHERE token = ?')
-    .bind(token).first<FakeToken>();
-  return result ?? null;
+export function getFakeTokenByToken(db: Database.Database, token: string): FakeToken | null {
+  return db.prepare('SELECT * FROM fake_tokens WHERE token = ?').get(token) as FakeToken | undefined ?? null;
 }
 
-export async function listFakeTokens(db: D1Database, agentId: string): Promise<FakeToken[]> {
-  const result = await db.prepare('SELECT * FROM fake_tokens WHERE agent_id = ? ORDER BY provider')
-    .bind(agentId).all<FakeToken>();
-  return result.results ?? [];
+export function listFakeTokens(db: Database.Database, agentId: string): FakeToken[] {
+  return db.prepare('SELECT * FROM fake_tokens WHERE agent_id = ? ORDER BY provider').all(agentId) as FakeToken[];
 }
 
-export async function deleteFakeToken(db: D1Database, id: string, agentId: string): Promise<void> {
-  await db.prepare('DELETE FROM fake_tokens WHERE id = ? AND agent_id = ?')
-    .bind(id, agentId).run();
+export function deleteFakeToken(db: Database.Database, id: string, agentId: string): void {
+  db.prepare('DELETE FROM fake_tokens WHERE id = ? AND agent_id = ?').run(id, agentId);
 }
 
-export async function updateFakeTokenLastUsed(db: D1Database, id: string): Promise<void> {
+export function updateFakeTokenLastUsed(db: Database.Database, id: string): void {
   const now = new Date().toISOString();
-  await db.prepare('UPDATE fake_tokens SET last_used_at = ? WHERE id = ?')
-    .bind(now, id).run();
+  db.prepare('UPDATE fake_tokens SET last_used_at = ? WHERE id = ?').run(now, id);
 }
 
-// ─── Secret Access (Agent Permissions) ─────────────────────────────────────────
+// ─── Secret Access ─────────────────────────────────────────────────────────────
 
-export interface SecretAccess {
-  secret_id: string;
-  agent_id: string;
-  created_at: string;
+export function getSecretAccess(db: Database.Database, secretId: string): SecretAccess[] {
+  return db.prepare('SELECT * FROM secret_access WHERE secret_id = ?').all(secretId) as SecretAccess[];
 }
 
-export async function getSecretAccess(db: D1Database, secretId: string): Promise<SecretAccess[]> {
-  const result = await db.prepare(
-    'SELECT * FROM secret_access WHERE secret_id = ?'
-  ).bind(secretId).all<SecretAccess>();
-  return result.results ?? [];
-}
-
-export async function setSecretAccess(db: D1Database, secretId: string, agentIds: string[]): Promise<void> {
-  // Clear existing access
-  await db.prepare('DELETE FROM secret_access WHERE secret_id = ?').bind(secretId).run();
-  
-  // If empty array, secret becomes global (no entries = all agents can access)
-  if (agentIds.length === 0) {
-    return;
-  }
-  
-  // Add new access entries
+export function setSecretAccess(db: Database.Database, secretId: string, agentIds: string[]): void {
+  db.prepare('DELETE FROM secret_access WHERE secret_id = ?').run(secretId);
+  if (agentIds.length === 0) return;
   const now = new Date().toISOString();
+  const stmt = db.prepare('INSERT INTO secret_access (secret_id, agent_id, created_at) VALUES (?, ?, ?)');
   for (const agentId of agentIds) {
-    await db.prepare(
-      'INSERT INTO secret_access (secret_id, agent_id, created_at) VALUES (?, ?, ?)'
-    ).bind(secretId, agentId, now).run();
+    stmt.run(secretId, agentId, now);
   }
 }
 
-export async function isSecretGlobal(db: D1Database, secretId: string): Promise<boolean> {
-  const result = await db.prepare(
-    'SELECT COUNT(*) as count FROM secret_access WHERE secret_id = ?'
-  ).bind(secretId).first<{ count: number }>();
-  return (result?.count ?? 0) === 0;
+// ─── Actuators ─────────────────────────────────────────────────────────────────
+
+export function createActuator(db: Database.Database, agentId: string, name: string, type: string = 'vps'): Actuator {
+  const id = generateId();
+  const now = new Date().toISOString();
+  db.prepare('INSERT INTO actuators (id, agent_id, name, type, status, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, agentId, name, type, 'offline', now);
+  return { id, agent_id: agentId, name, type, status: 'offline', last_seen_at: null, created_at: now };
+}
+
+export function getActuatorById(db: Database.Database, id: string): Actuator | null {
+  return db.prepare('SELECT * FROM actuators WHERE id = ?').get(id) as Actuator | undefined ?? null;
+}
+
+export function listActuators(db: Database.Database, agentId: string): Actuator[] {
+  return db.prepare('SELECT * FROM actuators WHERE agent_id = ? ORDER BY created_at DESC').all(agentId) as Actuator[];
+}
+
+export function listActuatorsByAccount(db: Database.Database, accountId: string): Actuator[] {
+  return db.prepare(`
+    SELECT a.* FROM actuators a
+    JOIN agents ag ON a.agent_id = ag.id
+    WHERE ag.account_id = ?
+    ORDER BY a.created_at DESC
+  `).all(accountId) as Actuator[];
+}
+
+export function deleteActuator(db: Database.Database, id: string): void {
+  db.prepare('DELETE FROM actuators WHERE id = ?').run(id);
+}
+
+export function updateActuatorStatus(db: Database.Database, id: string, status: string): void {
+  const now = new Date().toISOString();
+  db.prepare('UPDATE actuators SET status = ?, last_seen_at = ? WHERE id = ?').run(status, now, id);
+}
+
+// ─── Capabilities ──────────────────────────────────────────────────────────────
+
+export function addCapability(db: Database.Database, actuatorId: string, capability: string, constraints?: string): Capability {
+  const id = generateId();
+  const now = new Date().toISOString();
+  db.prepare('INSERT OR REPLACE INTO capabilities (id, actuator_id, capability, constraints, created_at) VALUES (?, ?, ?, ?, ?)')
+    .run(id, actuatorId, capability, constraints ?? null, now);
+  return { id, actuator_id: actuatorId, capability, constraints: constraints ?? null, created_at: now };
+}
+
+export function removeCapability(db: Database.Database, actuatorId: string, capability: string): void {
+  db.prepare('DELETE FROM capabilities WHERE actuator_id = ? AND capability = ?').run(actuatorId, capability);
+}
+
+export function listCapabilities(db: Database.Database, actuatorId: string): Capability[] {
+  return db.prepare('SELECT * FROM capabilities WHERE actuator_id = ? ORDER BY capability').all(actuatorId) as Capability[];
+}
+
+export function findActuatorWithCapability(db: Database.Database, agentId: string, capability: string, onlineOnly: boolean = true): Actuator | null {
+  const statusFilter = onlineOnly ? "AND a.status = 'online'" : '';
+  return db.prepare(`
+    SELECT a.* FROM actuators a
+    JOIN capabilities c ON c.actuator_id = a.id
+    WHERE a.agent_id = ? AND c.capability = ? ${statusFilter}
+    LIMIT 1
+  `).get(agentId, capability) as Actuator | undefined ?? null;
+}
+
+// ─── Command Queue ─────────────────────────────────────────────────────────────
+
+export function createCommand(db: Database.Database, agentId: string, actuatorId: string | null, capability: string, payload: string, ttlSeconds: number = 300): Command {
+  const id = generateId();
+  const now = new Date().toISOString();
+  db.prepare(
+    'INSERT INTO command_queue (id, agent_id, actuator_id, capability, payload, status, created_at, ttl_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(id, agentId, actuatorId, capability, payload, 'pending', now, ttlSeconds);
+  return { id, agent_id: agentId, actuator_id: actuatorId, capability, payload, status: 'pending', result: null, created_at: now, delivered_at: null, completed_at: null, ttl_seconds: ttlSeconds };
+}
+
+export function getCommandById(db: Database.Database, id: string): Command | null {
+  return db.prepare('SELECT * FROM command_queue WHERE id = ?').get(id) as Command | undefined ?? null;
+}
+
+export function getPendingCommands(db: Database.Database, actuatorId: string): Command[] {
+  return db.prepare("SELECT * FROM command_queue WHERE (actuator_id = ? OR actuator_id IS NULL) AND status = 'pending' ORDER BY created_at ASC").all(actuatorId) as Command[];
+}
+
+export function updateCommandStatus(db: Database.Database, id: string, status: string, result?: string): void {
+  const now = new Date().toISOString();
+  if (status === 'delivered') {
+    db.prepare('UPDATE command_queue SET status = ?, delivered_at = ? WHERE id = ?').run(status, now, id);
+  } else if (status === 'completed' || status === 'failed') {
+    db.prepare('UPDATE command_queue SET status = ?, result = ?, completed_at = ? WHERE id = ?').run(status, result ?? null, now, id);
+  } else {
+    db.prepare('UPDATE command_queue SET status = ? WHERE id = ?').run(status, id);
+  }
+}
+
+export function listRecentCommands(db: Database.Database, agentId: string, limit: number = 50): Command[] {
+  return db.prepare('SELECT * FROM command_queue WHERE agent_id = ? ORDER BY created_at DESC LIMIT ?').all(agentId, limit) as Command[];
+}
+
+export function listRecentCommandsByAccount(db: Database.Database, accountId: string, limit: number = 50): Command[] {
+  return db.prepare(`
+    SELECT cq.* FROM command_queue cq
+    JOIN agents ag ON cq.agent_id = ag.id
+    WHERE ag.account_id = ?
+    ORDER BY cq.created_at DESC LIMIT ?
+  `).all(accountId, limit) as Command[];
+}
+
+export function expireStaleCommands(db: Database.Database): number {
+  const result = db.prepare(`
+    UPDATE command_queue SET status = 'expired'
+    WHERE status IN ('pending', 'delivered')
+      AND datetime(created_at, '+' || ttl_seconds || ' seconds') < datetime('now')
+  `).run();
+  return result.changes;
 }
