@@ -104,6 +104,9 @@ app.post('/v1/command', async (c) => {
     ttl_seconds?: number;
   }>();
 
+  if (!body.actuator_id) {
+    return c.json({ error: 'actuator_id is required. Query GET /v1/actuators to discover available actuators.' }, 400);
+  }
   if (!body.capability || !body.payload) {
     return c.json({ error: 'capability and payload required' }, 400);
   }

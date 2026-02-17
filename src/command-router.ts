@@ -17,58 +17,74 @@ export class CommandRouter {
   ) {}
 
   /**
-   * Handle a command request from a brain
+   * Handle a command request from a brain.
+   * 
+   * actuator_id is REQUIRED. No wildcard routing, no capability-based guessing.
+   * The agent must know which actuator it's targeting. If it doesn't know,
+   * it should query GET /v1/actuators first and pick one.
    */
   handleCommandRequest(agentId: string, accountId: string, msg: CommandRequest): void {
     const brainConn = this.hub.getBrainConnection(agentId);
 
-    // Find target actuator
-    let actuatorId = msg.actuator_id;
-    let actuator;
+    // actuator_id is required — no implicit routing
+    if (!msg.actuator_id || msg.actuator_id === '*') {
+      if (brainConn) {
+        brainConn.ws.send(serialize(makeError(
+          'actuator_required',
+          'actuator_id is required. Query GET /v1/actuators to discover available actuators.',
+          msg.id,
+        )));
+      }
+      return;
+    }
 
-    if (!actuatorId || actuatorId === '*') {
-      // Find any online actuator with the capability
-      actuator = db.findActuatorWithCapability(this.database, agentId, msg.capability, true);
-      if (!actuator) {
-        // Queue for later delivery
-        const cmd = db.createCommand(this.database, agentId, null, msg.capability, JSON.stringify(msg.payload), msg.ttl_seconds ?? 300);
-        if (brainConn) {
-          brainConn.ws.send(serialize({ type: 'result_delivery', id: cmd.id, status: 'completed', result: { queued: true, command_id: cmd.id } }));
-        }
-        return;
+    const actuatorId = msg.actuator_id;
+
+    // Look up the actuator
+    const actuator = db.getActuatorById(this.database, actuatorId);
+    if (!actuator) {
+      if (brainConn) brainConn.ws.send(serialize(makeError('not_found', `Actuator ${actuatorId} not found`, msg.id)));
+      return;
+    }
+
+    // Verify the actuator belongs to this agent
+    if (actuator.agent_id !== agentId) {
+      if (brainConn) brainConn.ws.send(serialize(makeError('forbidden', 'Actuator does not belong to this agent', msg.id)));
+      return;
+    }
+
+    // Verify the actuator has the requested capability
+    const caps = db.listCapabilities(this.database, actuatorId);
+    if (!caps.some(c => c.capability === msg.capability)) {
+      if (brainConn) {
+        brainConn.ws.send(serialize(makeError(
+          'no_capability',
+          `Actuator ${actuatorId} lacks capability: ${msg.capability}. Available: ${caps.map(c => c.capability).join(', ') || 'none'}`,
+          msg.id,
+        )));
       }
-      actuatorId = actuator.id;
-    } else {
-      // Specific actuator
-      actuator = db.getActuatorById(this.database, actuatorId);
-      if (!actuator) {
-        if (brainConn) brainConn.ws.send(serialize(makeError('not_found', `Actuator ${actuatorId} not found`, msg.id)));
-        return;
-      }
-      // Verify ownership
-      const agent = db.getAgentById(this.database, agentId);
-      if (!agent || actuator.agent_id !== agentId) {
-        if (brainConn) brainConn.ws.send(serialize(makeError('forbidden', 'Actuator does not belong to this agent', msg.id)));
-        return;
-      }
-      // Check capability
-      const caps = db.listCapabilities(this.database, actuatorId);
-      if (!caps.some(c => c.capability === msg.capability)) {
-        if (brainConn) brainConn.ws.send(serialize(makeError('no_capability', `Actuator lacks capability: ${msg.capability}`, msg.id)));
-        return;
-      }
+      return;
     }
 
     // Create command record
-    const cmd = db.createCommand(this.database, agentId, actuatorId!, msg.capability, JSON.stringify(msg.payload), msg.ttl_seconds ?? 300);
+    const cmd = db.createCommand(this.database, agentId, actuatorId, msg.capability, JSON.stringify(msg.payload), msg.ttl_seconds ?? 300);
 
     // Try to deliver
-    const actuatorConn = this.hub.getActuatorConnection(agentId, actuatorId!);
+    const actuatorConn = this.hub.getActuatorConnection(agentId, actuatorId);
     if (actuatorConn) {
       actuatorConn.ws.send(serialize({ type: 'command_delivery', id: cmd.id, capability: msg.capability, payload: msg.payload }));
       db.updateCommandStatus(this.database, cmd.id, 'delivered');
+    } else {
+      // Actuator registered but not currently connected — command stays pending
+      if (brainConn) {
+        brainConn.ws.send(serialize({
+          type: 'result_delivery',
+          id: cmd.id,
+          status: 'completed',
+          result: { queued: true, command_id: cmd.id, reason: 'Actuator offline, command queued for delivery' },
+        }));
+      }
     }
-    // else: stays pending, will be delivered when actuator connects
   }
 
   /**
@@ -106,25 +122,19 @@ export class CommandRouter {
   }
 
   /**
-   * Deliver queued commands to a newly-connected actuator
+   * Deliver queued commands to a newly-connected actuator.
+   * Only delivers commands explicitly targeted at this actuator (no wildcard pickup).
    */
   deliverQueuedCommands(agentId: string, actuatorId: string): void {
-    const pending = db.getPendingCommands(this.database, actuatorId);
     const actuatorConn = this.hub.getActuatorConnection(agentId, actuatorId);
     if (!actuatorConn) return;
 
-    // Also check for wildcard commands (actuator_id IS NULL) that match capabilities
-    const caps = new Set(db.listCapabilities(this.database, actuatorId).map(c => c.capability));
-    const wildcardPending = db.getPendingCommands(this.database, actuatorId);
-
-    for (const cmd of wildcardPending) {
-      if (cmd.actuator_id === null && !caps.has(cmd.capability)) continue;
+    const pending = db.getPendingCommands(this.database, actuatorId);
+    for (const cmd of pending) {
+      // Only deliver commands explicitly assigned to this actuator
+      if (cmd.actuator_id !== actuatorId) continue;
       actuatorConn.ws.send(serialize({ type: 'command_delivery', id: cmd.id, capability: cmd.capability, payload: JSON.parse(cmd.payload) }));
       db.updateCommandStatus(this.database, cmd.id, 'delivered');
-      // Assign actuator
-      if (cmd.actuator_id === null) {
-        this.database.prepare('UPDATE command_queue SET actuator_id = ? WHERE id = ?').run(actuatorId, cmd.id);
-      }
     }
   }
 }
