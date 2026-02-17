@@ -61,7 +61,12 @@ export function createAgent(db: Database.Database, accountId: string, name: stri
     'INSERT INTO agents (id, account_id, name, token_hash, scopes, created_at) VALUES (?, ?, ?, ?, ?, ?)'
   ).run(id, accountId, name, tokenHash, '[]', now);
 
-  return { id, account_id: accountId, name, token_hash: tokenHash, scopes: '[]', created_at: now, last_seen_at: null, _plaintext_token: plaintextToken };
+  const agent = { id, account_id: accountId, name, token_hash: tokenHash, scopes: '[]', created_at: now, last_seen_at: null, _plaintext_token: plaintextToken };
+
+  // Auto-create null actuator for new agents
+  ensureNullActuator(db, id);
+
+  return agent;
 }
 
 export function getAgentByTokenHash(db: Database.Database, tokenHash: string): Agent | null {
@@ -247,6 +252,27 @@ export function setSecretAccess(db: Database.Database, secretId: string, agentId
 }
 
 // ─── Actuators ─────────────────────────────────────────────────────────────────
+
+/** Well-known null actuator ID — commands sent here are acknowledged but not executed */
+export const NULL_ACTUATOR_ID = 'actuator_null';
+
+/**
+ * Ensure the null actuator exists for a given agent.
+ * The null actuator is a /dev/null equivalent — commands are accepted and immediately
+ * completed with exit code 0 and empty output. Safe default for unconfigured agents.
+ */
+export function ensureNullActuator(db: Database.Database, agentId: string): Actuator {
+  const existing = db.prepare('SELECT * FROM actuators WHERE id = ? AND agent_id = ?').get(`${NULL_ACTUATOR_ID}_${agentId}`, agentId) as Actuator | undefined;
+  if (existing) return existing;
+  const id = `${NULL_ACTUATOR_ID}_${agentId}`;
+  const now = new Date().toISOString();
+  db.prepare('INSERT INTO actuators (id, agent_id, name, type, status, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, agentId, '/dev/null', 'null', 'online', now);
+  return { id, agent_id: agentId, name: '/dev/null', type: 'null', status: 'online', last_seen_at: null, created_at: now };
+}
+
+export function isNullActuator(actuatorId: string): boolean {
+  return actuatorId.startsWith(NULL_ACTUATOR_ID);
+}
 
 export function createActuator(db: Database.Database, agentId: string, name: string, type: string = 'vps'): Actuator {
   const id = generateId();

@@ -5,6 +5,7 @@
 import type Database from 'better-sqlite3';
 import type { WsHub } from './ws-hub.js';
 import * as db from './db.js';
+import { isNullActuator } from './db.js';
 import { decrypt } from './crypto.js';
 import type { CommandRequest, CommandResult, CredentialRequest } from './protocol.js';
 import { serialize, makeError } from './protocol.js';
@@ -39,6 +40,21 @@ export class CommandRouter {
     }
 
     const actuatorId = msg.actuator_id;
+
+    // Null actuator: immediately complete with empty success
+    if (isNullActuator(actuatorId)) {
+      const cmd = db.createCommand(this.database, agentId, actuatorId, msg.capability, JSON.stringify(msg.payload), 0);
+      db.updateCommandStatus(this.database, cmd.id, 'completed', JSON.stringify({ stdout: '', stderr: '', exitCode: 0, null_actuator: true }));
+      if (brainConn) {
+        brainConn.ws.send(serialize({
+          type: 'result_delivery',
+          id: cmd.id,
+          status: 'completed',
+          result: { stdout: '', stderr: '', exitCode: 0, null_actuator: true },
+        }));
+      }
+      return;
+    }
 
     // Look up the actuator
     const actuator = db.getActuatorById(this.database, actuatorId);
