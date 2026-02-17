@@ -6,11 +6,11 @@ import type { IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
 import { WebSocketServer, WebSocket } from 'ws';
 import type Database from 'better-sqlite3';
-import * as db from './db';
-import { hashToken } from './crypto';
-import { serialize, deserialize, makeError } from './protocol';
-import type { CommandRouter } from './command-router';
-import type { BrokerConfig } from './config';
+import * as db from './db.js';
+import { hashToken } from './crypto.js';
+import { serialize, deserialize, makeError } from './protocol.js';
+import type { CommandRouter } from './command-router.js';
+import type { BrokerConfig } from './config.js';
 
 export interface Connection {
   ws: WebSocket;

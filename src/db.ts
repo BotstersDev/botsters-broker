@@ -3,18 +3,37 @@
  */
 
 import type Database from 'better-sqlite3';
-import { generateId, generateToken, hashToken } from './crypto';
-import type { Account, Agent, Secret, AuditEntry, Session, FakeToken, SecretAccess, Actuator, Capability, Command } from './types';
+import { generateId, generateToken, hashToken } from './crypto.js';
+import type { Account, Agent, Secret, AuditEntry, Session, FakeToken, SecretAccess, Actuator, Capability, Command, CapabilityGrant } from './types.js';
 
 // ─── Accounts (formerly Clients) ──────────────────────────────────────────────
 
-export function createAccount(db: Database.Database, email: string, passwordHash: string, name?: string): Account {
+export function createAccount(db: Database.Database, email: string, passwordHash: string, name?: string, plan?: string): Account {
   const id = generateId();
   const now = new Date().toISOString();
+  const accountPlan = plan ?? 'free';
   db.prepare(
-    'INSERT INTO accounts (id, email, password_hash, name, created_at) VALUES (?, ?, ?, ?, ?)'
-  ).run(id, email, passwordHash, name ?? null, now);
-  return { id, email, password_hash: passwordHash, name: name ?? null, created_at: now };
+    'INSERT INTO accounts (id, email, password_hash, name, plan, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(id, email, passwordHash, name ?? null, accountPlan, 'active', now, now);
+  return { id, email, password_hash: passwordHash, name: name ?? null, stripe_customer: null, plan: accountPlan, status: 'active', created_at: now, updated_at: now };
+}
+
+export function updateAccount(db: Database.Database, id: string, fields: { name?: string; email?: string; plan?: string; status?: string; stripe_customer?: string }): void {
+  const now = new Date().toISOString();
+  const sets: string[] = ['updated_at = ?'];
+  const values: any[] = [now];
+  if (fields.name !== undefined) { sets.push('name = ?'); values.push(fields.name); }
+  if (fields.email !== undefined) { sets.push('email = ?'); values.push(fields.email); }
+  if (fields.plan !== undefined) { sets.push('plan = ?'); values.push(fields.plan); }
+  if (fields.status !== undefined) { sets.push('status = ?'); values.push(fields.status); }
+  if (fields.stripe_customer !== undefined) { sets.push('stripe_customer = ?'); values.push(fields.stripe_customer); }
+  values.push(id);
+  db.prepare(`UPDATE accounts SET ${sets.join(', ')} WHERE id = ?`).run(...values);
+}
+
+export function deactivateAccount(db: Database.Database, id: string): void {
+  const now = new Date().toISOString();
+  db.prepare("UPDATE accounts SET status = 'canceled', updated_at = ? WHERE id = ?").run(now, id);
 }
 
 export function getAccountByEmail(db: Database.Database, email: string): Account | null {
@@ -64,6 +83,15 @@ export function listAgents(db: Database.Database, accountId: string): Agent[] {
 
 export function deleteAgent(db: Database.Database, id: string, accountId: string): void {
   db.prepare('DELETE FROM agents WHERE id = ? AND account_id = ?').run(id, accountId);
+}
+
+export function rotateAgentToken(db: Database.Database, id: string, accountId: string): { token: string; tokenHash: string } | null {
+  const agent = db.prepare('SELECT * FROM agents WHERE id = ? AND account_id = ?').get(id, accountId) as Agent | undefined;
+  if (!agent) return null;
+  const newToken = generateToken('seks_agent');
+  const newHash = hashToken(newToken);
+  db.prepare('UPDATE agents SET token_hash = ? WHERE id = ?').run(newHash, id);
+  return { token: newToken, tokenHash: newHash };
 }
 
 export function updateAgentLastSeen(db: Database.Database, id: string): void {
@@ -128,6 +156,11 @@ export function updateSecret(db: Database.Database, id: string, accountId: strin
     db.prepare('UPDATE secrets SET name = ?, provider = ?, updated_at = ? WHERE id = ? AND account_id = ?')
       .run(name, provider, now, id, accountId);
   }
+}
+
+export function isSecretGlobal(db: Database.Database, secretId: string): boolean {
+  const row = db.prepare('SELECT COUNT(*) as count FROM secret_access WHERE secret_id = ?').get(secretId) as { count: number };
+  return row.count === 0;
 }
 
 // ─── Audit Log ─────────────────────────────────────────────────────────────────
@@ -274,6 +307,43 @@ export function findActuatorWithCapability(db: Database.Database, agentId: strin
     WHERE a.agent_id = ? AND c.capability = ? ${statusFilter}
     LIMIT 1
   `).get(agentId, capability) as Actuator | undefined ?? null;
+}
+
+// ─── Capability Grants ─────────────────────────────────────────────────────────
+
+export function grantCapability(db: Database.Database, agentId: string, provider: string, capability: string, secretId: string, constraints?: string): CapabilityGrant {
+  const id = generateId();
+  const now = new Date().toISOString();
+  db.prepare(
+    'INSERT OR REPLACE INTO capability_grants (id, agent_id, provider, capability, secret_id, constraints, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).run(id, agentId, provider, capability, secretId, constraints ?? null, now);
+  return { id, agent_id: agentId, provider, capability, secret_id: secretId, constraints: constraints ?? null, created_at: now };
+}
+
+export function revokeCapability(db: Database.Database, grantId: string): void {
+  db.prepare('DELETE FROM capability_grants WHERE id = ?').run(grantId);
+}
+
+export function listCapabilityGrants(db: Database.Database, agentId: string): CapabilityGrant[] {
+  return db.prepare('SELECT * FROM capability_grants WHERE agent_id = ? ORDER BY provider, capability').all(agentId) as CapabilityGrant[];
+}
+
+export function resolveCapability(db: Database.Database, agentId: string, provider: string, capability: string): string | null {
+  // Try exact match first
+  const exact = db.prepare(
+    'SELECT secret_id FROM capability_grants WHERE agent_id = ? AND provider = ? AND capability = ?'
+  ).get(agentId, provider, capability) as { secret_id: string } | undefined;
+  if (exact) return exact.secret_id;
+
+  // Try wildcard match
+  const wildcard = db.prepare(
+    "SELECT secret_id FROM capability_grants WHERE agent_id = ? AND provider = ? AND capability = '*'"
+  ).get(agentId, provider) as { secret_id: string } | undefined;
+  return wildcard?.secret_id ?? null;
+}
+
+export function grantAllCapabilities(db: Database.Database, agentId: string, secretId: string, provider: string): CapabilityGrant {
+  return grantCapability(db, agentId, provider, '*', secretId);
 }
 
 // ─── Command Queue ─────────────────────────────────────────────────────────────

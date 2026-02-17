@@ -3,11 +3,11 @@
  */
 
 import type Database from 'better-sqlite3';
-import type { WsHub } from './ws-hub';
-import * as db from './db';
-import { decrypt } from './crypto';
-import type { CommandRequest, CommandResult, CredentialRequest } from './protocol';
-import { serialize, makeError } from './protocol';
+import type { WsHub } from './ws-hub.js';
+import * as db from './db.js';
+import { decrypt } from './crypto.js';
+import type { CommandRequest, CommandResult, CredentialRequest } from './protocol.js';
+import { serialize, makeError } from './protocol.js';
 
 export class CommandRouter {
   constructor(

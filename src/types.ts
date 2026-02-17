@@ -16,7 +16,11 @@ export interface Account {
   email: string;
   password_hash: string;
   name: string | null;
+  stripe_customer: string | null;
+  plan: string;
+  status: string;
   created_at: string;
+  updated_at: string;
 }
 
 // Backwards compat alias
@@ -93,6 +97,16 @@ export interface Capability {
   id: string;
   actuator_id: string;
   capability: string;
+  constraints: string | null;
+  created_at: string;
+}
+
+export interface CapabilityGrant {
+  id: string;
+  agent_id: string;
+  provider: string;
+  capability: string;
+  secret_id: string | null;
   constraints: string | null;
   created_at: string;
 }

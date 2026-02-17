@@ -4,10 +4,11 @@
 
 import { Hono } from 'hono';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
-import type { Env, Account, Agent, Secret, AuditEntry } from './types';
-import * as db from './db';
-import { encrypt, hashPassword, verifyPassword } from './crypto';
+import type { Env, Account, Agent, Secret, AuditEntry } from './types.js';
+import * as db from './db.js';
+import { encrypt, decrypt, hashPassword, verifyPassword } from './crypto.js';
 import { html, raw } from 'hono/html';
+import type { HtmlEscapedString } from 'hono/utils/html';
 
 export const webRoutes = new Hono<{ Bindings: Env }>();
 
@@ -90,7 +91,7 @@ const baseStyles = `
   .gap-2 { gap: 0.5rem; }
 `;
 
-function layout(title: string, content: string, nav?: string) {
+function layout(title: string, content: string | HtmlEscapedString | Promise<HtmlEscapedString>, nav?: string | HtmlEscapedString | Promise<HtmlEscapedString>) {
   return html`<!DOCTYPE html>
 <html lang="en">
 <head>

@@ -6,7 +6,11 @@ CREATE TABLE IF NOT EXISTS accounts (
     email TEXT UNIQUE NOT NULL,
     password_hash TEXT NOT NULL,
     name TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    stripe_customer TEXT,
+    plan TEXT DEFAULT 'free',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- Agents (AI agents that access secrets)
@@ -109,6 +113,18 @@ CREATE TABLE IF NOT EXISTS command_queue (
     ttl_seconds INTEGER DEFAULT 300
 );
 
+-- Capability grants (maps agent capabilities to secrets)
+CREATE TABLE IF NOT EXISTS capability_grants (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    capability TEXT NOT NULL,
+    secret_id TEXT REFERENCES secrets(id) ON DELETE CASCADE,
+    constraints TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(agent_id, provider, capability)
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_secret_access_secret ON secret_access(secret_id);
 CREATE INDEX IF NOT EXISTS idx_secret_access_agent ON secret_access(agent_id);
@@ -126,3 +142,5 @@ CREATE INDEX IF NOT EXISTS idx_capabilities_actuator ON capabilities(actuator_id
 CREATE INDEX IF NOT EXISTS idx_command_queue_agent ON command_queue(agent_id);
 CREATE INDEX IF NOT EXISTS idx_command_queue_actuator ON command_queue(actuator_id);
 CREATE INDEX IF NOT EXISTS idx_command_queue_status ON command_queue(status);
+CREATE INDEX IF NOT EXISTS idx_capability_grants_agent ON capability_grants(agent_id);
+CREATE INDEX IF NOT EXISTS idx_capability_grants_secret ON capability_grants(secret_id);

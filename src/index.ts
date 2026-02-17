@@ -12,12 +12,14 @@ import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { apiRoutes } from './api';
-import { webRoutes } from './web';
-import { WsHub } from './ws-hub';
-import { CommandRouter } from './command-router';
-import { loadConfig } from './config';
-import type { Env } from './types';
+import { apiRoutes } from './api.js';
+import { accountRoutes } from './api-accounts.js';
+import { inferenceRoutes } from './inference.js';
+import { webRoutes } from './web.js';
+import { WsHub } from './ws-hub.js';
+import { CommandRouter } from './command-router.js';
+import { loadConfig } from './config.js';
+import type { Env } from './types.js';
 
 // Load config
 const config = loadConfig();
@@ -59,8 +61,64 @@ app.use('/api/*', cors());
 app.route('/v1', apiRoutes);
 app.route('', apiRoutes);
 
+// Account management API routes
+app.route('/api', accountRoutes);
+app.route('/v1/api', accountRoutes);
+
+// Inference proxy routes (the spine's core capability)
+app.route('/v1', inferenceRoutes);
+app.route('', inferenceRoutes);
+
 // Web UI routes
 app.route('/', webRoutes);
+
+// ─── REST command API (for testing / brain HTTP fallback) ──────────────────────
+
+// List connected actuators
+app.get('/v1/actuators', async (c) => {
+  const conns = hub.getActiveConnections().filter(c => c.role === 'actuator');
+  return c.json(conns.map(a => ({
+    actuatorId: a.actuatorId,
+    agentId: a.agentId,
+    capabilities: a.capabilities,
+    connId: a.connId,
+  })));
+});
+
+// Send command to actuator via REST
+app.post('/v1/command', async (c) => {
+  const authHeader = c.req.header('authorization');
+  const xApiKey = c.req.header('x-api-key');
+  const token = authHeader?.replace(/^Bearer\s+/i, '') || xApiKey;
+  if (!token) return c.json({ error: 'Missing auth token' }, 401);
+
+  // Authenticate agent
+  const { getAgentByToken } = await import('./db.js');
+  const agent = getAgentByToken(database, token);
+  if (!agent) return c.json({ error: 'Invalid token' }, 401);
+
+  const body = await c.req.json<{
+    capability: string;
+    actuator_id?: string;
+    payload: unknown;
+    ttl_seconds?: number;
+  }>();
+
+  if (!body.capability || !body.payload) {
+    return c.json({ error: 'capability and payload required' }, 400);
+  }
+
+  router.handleCommandRequest(agent.id, agent.account_id, {
+    type: 'command_request',
+    id: `rest_${Date.now()}`,
+    capability: body.capability,
+    actuator_id: body.actuator_id,
+    payload: body.payload,
+    ttl_seconds: body.ttl_seconds,
+  });
+
+  return c.json({ status: 'sent', message: 'Command routed. Results delivered via WS to brain.' });
+});
 
 // Create WebSocket hub
 const hub = new WsHub(database, config);

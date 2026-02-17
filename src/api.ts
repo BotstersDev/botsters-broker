@@ -3,9 +3,9 @@
  */
 
 import { Hono } from 'hono';
-import type { Agent, Env } from './types';
-import * as db from './db';
-import { decrypt, encrypt, hashPassword, hmacSign, sha256Hex, hmacSha256 } from './crypto';
+import type { Agent, Env } from './types.js';
+import * as db from './db.js';
+import { decrypt, encrypt, hashPassword, hmacSign, sha256Hex, hmacSha256 } from './crypto.js';
 
 export const apiRoutes = new Hono<{ Bindings: Env }>();
 
@@ -194,6 +194,73 @@ function checkScopedCapability(c: any, provider: string): boolean {
   if (!scoped?.caps) return true;
   return scoped.caps.includes(provider) || scoped.caps.includes('*');
 }
+
+// ─── Capability Grants (agent-facing) ──────────────────────────────────────────
+
+apiRoutes.get('/capabilities', (c) => {
+  const agent = authenticateAgent(c);
+  if (!agent) return c.json({ ok: false, error: 'Unauthorized' }, 401);
+
+  const grants = db.listCapabilityGrants(c.env.db, agent.id);
+  db.logAudit(c.env.db, agent.account_id, agent.id, 'capability.list', null, 'success');
+  return c.json({ ok: true, capabilities: grants });
+});
+
+apiRoutes.post('/capability-request', async (c) => {
+  const agent = authenticateAgent(c);
+  if (!agent) return c.json({ ok: false, error: 'Unauthorized' }, 401);
+
+  const body = await c.req.json<{ capability?: string; secret?: string }>();
+
+  // Path 1: by capability
+  if (body.capability) {
+    const parts = body.capability.split('/');
+    if (parts.length < 2) {
+      return c.json({ ok: false, error: 'Capability must be in format "provider/capability"' }, 400);
+    }
+    const provider = parts[0];
+    const cap = parts.slice(1).join('/');
+
+    const secretId = db.resolveCapability(c.env.db, agent.id, provider, cap);
+    if (!secretId) {
+      db.logAudit(c.env.db, agent.account_id, agent.id, 'capability.request', body.capability, 'not_found');
+      return c.json({ ok: false, error: `No grant found for capability '${body.capability}'` }, 404);
+    }
+
+    const secret = db.getSecretById(c.env.db, secretId, agent.account_id);
+    if (!secret) {
+      db.logAudit(c.env.db, agent.account_id, agent.id, 'capability.request', body.capability, 'not_found', null, 'secret deleted');
+      return c.json({ ok: false, error: 'Associated secret not found' }, 404);
+    }
+
+    try {
+      const value = decrypt(secret.encrypted_value, getMasterKey(c.env));
+      db.logAudit(c.env.db, agent.account_id, agent.id, 'capability.request', body.capability, 'success');
+      return c.json({ ok: true, value, provider: secret.provider, name: secret.name });
+    } catch {
+      return c.json({ ok: false, error: 'Failed to decrypt secret' }, 500);
+    }
+  }
+
+  // Path 2: by secret name (backward compat)
+  if (body.secret) {
+    const secret = db.getSecret(c.env.db, agent.account_id, body.secret, agent.id);
+    if (!secret) {
+      db.logAudit(c.env.db, agent.account_id, agent.id, 'capability.request', body.secret, 'not_found');
+      return c.json({ ok: false, error: `Secret '${body.secret}' not found` }, 404);
+    }
+
+    try {
+      const value = decrypt(secret.encrypted_value, getMasterKey(c.env));
+      db.logAudit(c.env.db, agent.account_id, agent.id, 'capability.request', body.secret, 'success');
+      return c.json({ ok: true, value, provider: secret.provider, name: secret.name });
+    } catch {
+      return c.json({ ok: false, error: 'Failed to decrypt secret' }, 500);
+    }
+  }
+
+  return c.json({ ok: false, error: 'Must provide either "capability" or "secret"' }, 400);
+});
 
 // ─── Get Secret ────────────────────────────────────────────────────────────────
 

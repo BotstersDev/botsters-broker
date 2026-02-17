@@ -10,7 +10,7 @@ import {
   verifyPassword,
   encrypt,
   decrypt 
-} from './crypto';
+} from './crypto.js';
 
 describe('generateId', () => {
   it('generates a valid UUID', () => {
@@ -87,7 +87,7 @@ describe('encryption', () => {
   it('fails to decrypt with wrong key', async () => {
     const encrypted = await encrypt('secret', testKey);
     const wrongKey = 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff';
-    await expect(decrypt(encrypted, wrongKey)).rejects.toThrow();
+    expect(() => decrypt(encrypted, wrongKey)).toThrow();
   });
 
   it('handles empty string', async () => {
