@@ -743,7 +743,7 @@ webRoutes.get('/actuators', (c) => {
         <td class="text-muted">${agentMap.get(a.agent_id) || 'Unknown'}</td>
         <td>${a.type}</td>
         <td>${statusBadge}</td>
-        <td>${caps.length > 0 ? caps.map(c => html`<span class="badge badge-muted" style="margin-right: 0.25rem;">${c.capability}</span>`).join('') : html`<span class="text-muted">none</span>`}</td>
+        <td>${caps.length > 0 ? raw(caps.map(c => `<span class="badge badge-muted" style="margin-right: 0.25rem;">${c.capability}</span>`).join('')) : html`<span class="text-muted">none</span>`}</td>
         <td class="text-muted">${a.last_seen_at?.replace('T', ' ').split('.')[0] || 'Never'}</td>
         <td>
           <div class="flex gap-2">
