@@ -92,10 +92,25 @@ app.post('/v1/command', async (c) => {
   const token = authHeader?.replace(/^Bearer\s+/i, '') || xApiKey;
   if (!token) return c.json({ error: 'Missing auth token' }, 401);
 
-  // Authenticate agent
-  const { getAgentByToken } = await import('./db.js');
+  // Authenticate — agent token or actuator token
+  const { getAgentByToken, getActuatorByToken, getAgentById } = await import('./db.js');
+  let agentId: string;
+  let accountId: string;
+
   const agent = getAgentByToken(database, token);
-  if (!agent) return c.json({ error: 'Invalid token' }, 401);
+  if (agent) {
+    agentId = agent.id;
+    accountId = agent.account_id;
+  } else if (token.startsWith('seks_actuator_')) {
+    const actuator = getActuatorByToken(database, token);
+    if (!actuator) return c.json({ error: 'Invalid token' }, 401);
+    const owner = getAgentById(database, actuator.agent_id);
+    if (!owner) return c.json({ error: 'Invalid token' }, 401);
+    agentId = owner.id;
+    accountId = owner.account_id;
+  } else {
+    return c.json({ error: 'Invalid token' }, 401);
+  }
 
   const body = await c.req.json<{
     capability: string;
@@ -111,7 +126,7 @@ app.post('/v1/command', async (c) => {
     return c.json({ error: 'capability and payload required' }, 400);
   }
 
-  router.handleCommandRequest(agent.id, agent.account_id, {
+  router.handleCommandRequest(agentId, accountId, {
     type: 'command_request',
     id: `rest_${Date.now()}`,
     capability: body.capability,

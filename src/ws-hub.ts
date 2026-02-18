@@ -75,26 +75,49 @@ export class WsHub {
       return;
     }
 
-    // Authenticate
+    // Authenticate — try agent token first, then actuator token
+    let agentId: string;
+    let accountId: string;
+
     const agent = db.getAgentByToken(this.database, token);
-    if (!agent) {
+    if (agent) {
+      agentId = agent.id;
+      accountId = agent.account_id;
+
+      // For actuator role with agent token, verify actuator belongs to this agent
+      if (role === 'actuator') {
+        const actuator = db.getActuatorById(this.database, actuatorId!);
+        if (!actuator || actuator.agent_id !== agent.id) {
+          socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+      }
+    } else if (role === 'actuator' && token.startsWith('seks_actuator_')) {
+      // Try actuator-specific token
+      const actuator = db.getActuatorByToken(this.database, token);
+      if (!actuator || actuator.id !== actuatorId) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      // Look up the owning agent to get account_id
+      const ownerAgent = db.getAgentById(this.database, actuator.agent_id);
+      if (!ownerAgent) {
+        socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      agentId = ownerAgent.id;
+      accountId = ownerAgent.account_id;
+    } else {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
       return;
     }
 
-    // For actuator role, verify actuator exists and belongs to this agent
-    if (role === 'actuator') {
-      const actuator = db.getActuatorById(this.database, actuatorId!);
-      if (!actuator || actuator.agent_id !== agent.id) {
-        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
-        socket.destroy();
-        return;
-      }
-    }
-
     this.wss.handleUpgrade(request, socket, head, (ws) => {
-      this.onConnection(ws, agent.id, agent.account_id, role, actuatorId ?? undefined);
+      this.onConnection(ws, agentId, accountId, role, actuatorId ?? undefined);
     });
   }
 

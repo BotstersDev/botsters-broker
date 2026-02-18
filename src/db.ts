@@ -78,6 +78,11 @@ export function getAgentByToken(db: Database.Database, token: string): Agent | n
   return getAgentByTokenHash(db, h);
 }
 
+export function getActuatorByToken(db: Database.Database, token: string): Actuator | null {
+  const h = hashToken(token);
+  return db.prepare('SELECT * FROM actuators WHERE token_hash = ?').get(h) as Actuator | undefined ?? null;
+}
+
 export function getAgentById(db: Database.Database, id: string): Agent | null {
   return db.prepare('SELECT * FROM agents WHERE id = ?').get(id) as Agent | undefined ?? null;
 }
@@ -283,7 +288,7 @@ export function ensureNullActuator(db: Database.Database, agentId: string): Actu
   const id = `${NULL_ACTUATOR_ID}_${agentId}`;
   const now = new Date().toISOString();
   db.prepare('INSERT INTO actuators (id, agent_id, name, type, status, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, agentId, '/dev/null', 'null', 'online', now);
-  return { id, agent_id: agentId, name: '/dev/null', type: 'null', status: 'online', last_seen_at: null, created_at: now };
+  return { id, agent_id: agentId, name: '/dev/null', type: 'null', status: 'online', last_seen_at: null, created_at: now, token_hash: null, encrypted_token: null };
 }
 
 export function isNullActuator(actuatorId: string): boolean {
@@ -294,7 +299,7 @@ export function createActuator(db: Database.Database, agentId: string, name: str
   const id = generateId();
   const now = new Date().toISOString();
   db.prepare('INSERT INTO actuators (id, agent_id, name, type, status, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, agentId, name, type, 'offline', now);
-  return { id, agent_id: agentId, name, type, status: 'offline', last_seen_at: null, created_at: now };
+  return { id, agent_id: agentId, name, type, status: 'offline', last_seen_at: null, created_at: now, token_hash: null, encrypted_token: null };
 }
 
 export function getActuatorById(db: Database.Database, id: string): Actuator | null {
