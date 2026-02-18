@@ -82,8 +82,8 @@ describe('capability matching', () => {
   }
 
   it('maps secret names to providers correctly', () => {
-    expect(secretToProvider('OPENAI_API_KEY')).toBe('openai');
-    expect(secretToProvider('ANTHROPIC_API_KEY')).toBe('anthropic');
+    expect(secretToProvider('OPENAI_TOKEN')).toBe('openai');
+    expect(secretToProvider('ANTHROPIC_TOKEN')).toBe('anthropic');
     expect(secretToProvider('GITHUB_PERSONAL_ACCESS_TOKEN')).toBe('github');
     expect(secretToProvider('AWS_ACCESS_KEY_ID')).toBe('aws');
     expect(secretToProvider('NOTION_API_KEY')).toBe('notion');
@@ -115,7 +115,7 @@ describe('capability matching', () => {
 
   it('filtering secrets by caps works', () => {
     const allSecrets = [
-      { name: 'OPENAI_API_KEY', provider: 'openai' },
+      { name: 'OPENAI_TOKEN', provider: 'openai' },
       { name: 'GITHUB_PERSONAL_ACCESS_TOKEN', provider: 'github' },
       { name: 'AWS_ACCESS_KEY_ID', provider: 'aws' },
       { name: 'NOTION_API_KEY', provider: 'notion' },
@@ -128,6 +128,6 @@ describe('capability matching', () => {
     });
 
     expect(filtered).toHaveLength(2);
-    expect(filtered.map(s => s.name)).toEqual(['OPENAI_API_KEY', 'GITHUB_PERSONAL_ACCESS_TOKEN']);
+    expect(filtered.map(s => s.name)).toEqual(['OPENAI_TOKEN', 'GITHUB_PERSONAL_ACCESS_TOKEN']);
   });
 });

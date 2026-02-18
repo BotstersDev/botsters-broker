@@ -107,7 +107,7 @@ describe('Inference Proxy', () => {
 
     // Add an Anthropic key
     const encryptedKey = encrypt('sk-ant-test', MASTER_KEY);
-    db.createSecret(database, account.id, 'ANTHROPIC_API_KEY', 'anthropic', encryptedKey);
+    db.createSecret(database, account.id, 'ANTHROPIC_TOKEN', 'anthropic', encryptedKey);
 
     const res = await app.request('/inference/providers', {
       headers: { 'Authorization': `Bearer ${agent._plaintext_token}` },

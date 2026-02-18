@@ -318,9 +318,9 @@ apiRoutes.post('/secrets/list', async (c) => {
 // ─── Proxy Request ─────────────────────────────────────────────────────────────
 
 const SERVICE_CONFIG: Record<string, { baseUrl: string; secretName: string; authHeader: string; authFormat?: string }> = {
-  openai: { baseUrl: 'https://api.openai.com', secretName: 'OPENAI_API_KEY', authHeader: 'Authorization', authFormat: 'Bearer' },
-  anthropic: { baseUrl: 'https://api.anthropic.com', secretName: 'ANTHROPIC_API_KEY', authHeader: 'x-api-key' },
-  claude: { baseUrl: 'https://api.anthropic.com', secretName: 'ANTHROPIC_API_KEY', authHeader: 'x-api-key' },
+  openai: { baseUrl: 'https://api.openai.com', secretName: 'OPENAI_TOKEN', authHeader: 'Authorization', authFormat: 'Bearer' },
+  anthropic: { baseUrl: 'https://api.anthropic.com', secretName: 'ANTHROPIC_TOKEN', authHeader: 'x-api-key' },
+  claude: { baseUrl: 'https://api.anthropic.com', secretName: 'ANTHROPIC_TOKEN', authHeader: 'x-api-key' },
   github: { baseUrl: 'https://api.github.com', secretName: 'GITHUB_PERSONAL_ACCESS_TOKEN', authHeader: 'Authorization', authFormat: 'Bearer' },
   notion: { baseUrl: 'https://api.notion.com', secretName: 'NOTION_API_KEY', authHeader: 'Authorization', authFormat: 'Bearer' },
   gemini: { baseUrl: 'https://generativelanguage.googleapis.com', secretName: 'GEMINI_API_KEY', authHeader: 'x-goog-api-key' },
