@@ -547,12 +547,21 @@ webRoutes.get('/agents', (c) => {
 
   const agents = db.listAgents(c.env.db, accountId);
 
-  // Note: with token_hash, we can't show plaintext tokens for existing agents.
-  // Only at creation time. We show the hash prefix as identifier.
-  const rows = raw(agents.map(a => html`
-    <tr>
+  const rows = raw(agents.map(a => {
+    let tokenDisplay = `<code class="token">${a.token_hash.slice(0, 16)}...</code>`;
+    if (a.encrypted_token) {
+      try {
+        const plaintext = decrypt(a.encrypted_token, c.env.masterKey);
+        tokenDisplay = `<code class="token" id="token-${a.id}" style="cursor:pointer;" onclick="
+          const el = this;
+          if (el.dataset.revealed === 'true') { el.textContent = '${a.token_hash.slice(0, 16)}... (click to reveal)'; el.dataset.revealed = 'false'; }
+          else { el.textContent = '${plaintext}'; el.dataset.revealed = 'true'; }
+        ">${a.token_hash.slice(0, 16)}... (click to reveal)</code>`;
+      } catch { /* decryption failed, show hash */ }
+    }
+    return `<tr>
       <td><strong>${a.name}</strong></td>
-      <td><code class="token">${a.token_hash.slice(0, 16)}...</code></td>
+      <td>${tokenDisplay}</td>
       <td class="text-muted">${a.created_at.split('T')[0]}</td>
       <td class="text-muted">${a.last_seen_at?.split('T')[0] || 'Never'}</td>
       <td>
@@ -563,8 +572,8 @@ webRoutes.get('/agents', (c) => {
           </form>
         </div>
       </td>
-    </tr>
-  `).join(''));
+    </tr>`;
+  }).join(''));
 
   const content = html`
     <main>
@@ -598,7 +607,7 @@ webRoutes.post('/agents/add', async (c) => {
   const body = await c.req.parseBody();
   const name = body.name as string;
 
-  const agent = db.createAgent(c.env.db, accountId, name);
+  const agent = db.createAgent(c.env.db, accountId, name, c.env.masterKey);
 
   // Show the plaintext token once
   const content = html`
@@ -868,6 +877,24 @@ webRoutes.get('/actuators/:id', (c) => {
           <p><strong>Status:</strong> <span class="badge ${actuator.status === 'online' ? 'badge-success' : 'badge-muted'}">${actuator.status}</span></p>
           <p><strong>Agent:</strong> ${agent.name}</p>
           <p><strong>Last Seen:</strong> ${actuator.last_seen_at || 'Never'}</p>
+          ${raw((() => {
+            if (actuator.encrypted_token) {
+              try {
+                const plaintext = decrypt(actuator.encrypted_token, c.env.masterKey);
+                return `<p><strong>Token:</strong> <code class="token" id="act-token" style="cursor:pointer;" onclick="
+                  const el = this;
+                  if (el.dataset.revealed === 'true') { el.textContent = '${actuator.token_hash?.slice(0, 16) || ''}... (click to reveal)'; el.dataset.revealed = 'false'; }
+                  else { el.textContent = '${plaintext}'; el.dataset.revealed = 'true'; }
+                ">${actuator.token_hash?.slice(0, 16) || ''}... (click to reveal)</code></p>`;
+              } catch { return ''; }
+            } else if (actuator.token_hash) {
+              return `<p><strong>Token Hash:</strong> <code class="token">${actuator.token_hash.slice(0, 16)}...</code></p>`;
+            }
+            return '<p class="text-muted">No token assigned</p>';
+          })())}
+          <form method="POST" action="/actuators/${actuator.id}/rotate-token" style="margin-top: 0.5rem;">
+            <button type="submit" class="btn btn-ghost btn-sm" onclick="return confirm('Rotate actuator token? The old token will stop working immediately.');">Rotate Token</button>
+          </form>
         </div>
         <div class="card">
           <h3>Capabilities</h3>
@@ -941,6 +968,18 @@ webRoutes.post('/actuators/:id/capabilities/:cap/delete', (c) => {
   const agent = db.getAgentById(c.env.db, actuator.agent_id);
   if (!agent || agent.account_id !== accountId) return redirect('/actuators');
   db.removeCapability(c.env.db, id, cap);
+  return redirect(`/actuators/${id}`);
+});
+
+webRoutes.post('/actuators/:id/rotate-token', (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
+  const id = c.req.param('id');
+  const actuator = db.getActuatorById(c.env.db, id);
+  if (!actuator) return redirect('/actuators');
+  const agent = db.getAgentById(c.env.db, actuator.agent_id);
+  if (!agent || agent.account_id !== accountId) return redirect('/actuators');
+  db.rotateActuatorToken(c.env.db, id, c.env.masterKey);
   return redirect(`/actuators/${id}`);
 });
 
