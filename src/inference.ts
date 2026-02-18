@@ -68,7 +68,7 @@ const PROVIDERS: Record<string, ProviderConfig> = {
   anthropic: {
     baseUrl: 'https://api.anthropic.com',
     messagesPath: '/v1/messages',
-    secretName: 'ANTHROPIC_API_KEY',
+    secretName: 'ANTHROPIC_TOKEN',
     authHeader: 'x-api-key',       // Default; overridden by dynamic auth for OAuth
     authFormat: 'raw',
     extraHeaders: {
@@ -95,7 +95,7 @@ const PROVIDERS: Record<string, ProviderConfig> = {
   openai: {
     baseUrl: 'https://api.openai.com',
     messagesPath: '/v1/chat/completions',
-    secretName: 'OPENAI_API_KEY',
+    secretName: 'OPENAI_TOKEN',
     authHeader: 'Authorization',
     authFormat: 'Bearer',
     buildBody: (req) => {

@@ -333,7 +333,7 @@ webRoutes.get('/secrets/add', (c) => {
           <form method="POST" action="/secrets/add">
             <div class="form-group">
               <label for="name">Secret Name</label>
-              <input type="text" id="name" name="name" required placeholder="OPENAI_API_KEY" pattern="[A-Z0-9_]+">
+              <input type="text" id="name" name="name" required placeholder="OPENAI_TOKEN" pattern="[A-Z0-9_]+">
               <small class="text-muted">Use uppercase with underscores</small>
             </div>
             <div class="form-group">
