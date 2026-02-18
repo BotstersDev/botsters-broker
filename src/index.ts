@@ -115,6 +115,8 @@ app.post('/v1/command', async (c) => {
     actuator_id?: string;
     payload: unknown;
     ttl_seconds?: number;
+    sync?: boolean;
+    timeout_ms?: number;
   }>();
 
   if (!body.actuator_id) {
@@ -124,7 +126,7 @@ app.post('/v1/command', async (c) => {
     return c.json({ error: 'capability and payload required' }, 400);
   }
 
-  router.handleCommandRequest(agentId, accountId, {
+  const { commandId, error } = router.handleCommandRequest(agentId, accountId, {
     type: 'command_request',
     id: `rest_${Date.now()}`,
     capability: body.capability,
@@ -133,7 +135,21 @@ app.post('/v1/command', async (c) => {
     ttl_seconds: body.ttl_seconds,
   });
 
-  return c.json({ status: 'sent', message: 'Command routed. Results delivered via WS to brain.' });
+  if (!commandId) {
+    return c.json({ status: 'error', error: error || 'Command failed' }, 400);
+  }
+
+  // Sync mode: wait for result and return it in the HTTP response
+  if (body.sync !== false) {
+    const timeoutMs = Math.min(body.timeout_ms || 30000, 60000);
+    const result = await router.waitForResult(commandId, timeoutMs);
+    if (result) {
+      return c.json({ status: result.status, command_id: commandId, result: result.result });
+    }
+    return c.json({ status: 'timeout', command_id: commandId, message: 'Command sent but result not received within timeout' }, 202);
+  }
+
+  return c.json({ status: 'sent', command_id: commandId, message: 'Command routed. Results delivered via WS to brain.' });
 });
 
 // Create WebSocket hub

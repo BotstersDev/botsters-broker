@@ -11,6 +11,8 @@ import type { CommandRequest, CommandResult, CredentialRequest } from './protoco
 import { serialize, makeError } from './protocol.js';
 
 export class CommandRouter {
+  private pendingResults = new Map<string, { resolve: (result: any) => void; timer: ReturnType<typeof setTimeout> }>();
+
   constructor(
     private database: Database.Database,
     private hub: WsHub,
@@ -24,19 +26,14 @@ export class CommandRouter {
    * The agent must know which actuator it's targeting. If it doesn't know,
    * it should query GET /v1/actuators first and pick one.
    */
-  handleCommandRequest(agentId: string, accountId: string, msg: CommandRequest): void {
+  handleCommandRequest(agentId: string, accountId: string, msg: CommandRequest): { commandId: string | null; error?: string } {
     const brainConn = this.hub.getBrainConnection(agentId);
 
     // actuator_id is required — no implicit routing
     if (!msg.actuator_id || msg.actuator_id === '*') {
-      if (brainConn) {
-        brainConn.ws.send(serialize(makeError(
-          'actuator_required',
-          'actuator_id is required. Query GET /v1/actuators to discover available actuators.',
-          msg.id,
-        )));
-      }
-      return;
+      const err = 'actuator_id is required. Query GET /v1/actuators to discover available actuators.';
+      if (brainConn) brainConn.ws.send(serialize(makeError('actuator_required', err, msg.id)));
+      return { commandId: null, error: err };
     }
 
     const actuatorId = msg.actuator_id;
@@ -47,39 +44,34 @@ export class CommandRouter {
       db.updateCommandStatus(this.database, cmd.id, 'completed', JSON.stringify({ stdout: '', stderr: '', exitCode: 0, null_actuator: true }));
       if (brainConn) {
         brainConn.ws.send(serialize({
-          type: 'result_delivery',
-          id: cmd.id,
-          status: 'completed',
+          type: 'result_delivery', id: cmd.id, status: 'completed',
           result: { stdout: '', stderr: '', exitCode: 0, null_actuator: true },
         }));
       }
-      return;
+      return { commandId: cmd.id };
     }
 
     // Look up the actuator
     const actuator = db.getActuatorById(this.database, actuatorId);
     if (!actuator) {
-      if (brainConn) brainConn.ws.send(serialize(makeError('not_found', `Actuator ${actuatorId} not found`, msg.id)));
-      return;
+      const err = `Actuator ${actuatorId} not found`;
+      if (brainConn) brainConn.ws.send(serialize(makeError('not_found', err, msg.id)));
+      return { commandId: null, error: err };
     }
 
     // Verify the actuator belongs to this agent
     if (actuator.agent_id !== agentId) {
-      if (brainConn) brainConn.ws.send(serialize(makeError('forbidden', 'Actuator does not belong to this agent', msg.id)));
-      return;
+      const err = 'Actuator does not belong to this agent';
+      if (brainConn) brainConn.ws.send(serialize(makeError('forbidden', err, msg.id)));
+      return { commandId: null, error: err };
     }
 
     // Verify the actuator has the requested capability
     const caps = db.listCapabilities(this.database, actuatorId);
     if (!caps.some(c => c.capability === msg.capability)) {
-      if (brainConn) {
-        brainConn.ws.send(serialize(makeError(
-          'no_capability',
-          `Actuator ${actuatorId} lacks capability: ${msg.capability}. Available: ${caps.map(c => c.capability).join(', ') || 'none'}`,
-          msg.id,
-        )));
-      }
-      return;
+      const err = `Actuator ${actuatorId} lacks capability: ${msg.capability}. Available: ${caps.map(c => c.capability).join(', ') || 'none'}`;
+      if (brainConn) brainConn.ws.send(serialize(makeError('no_capability', err, msg.id)));
+      return { commandId: null, error: err };
     }
 
     // Create command record
@@ -94,13 +86,14 @@ export class CommandRouter {
       // Actuator registered but not currently connected — command stays pending
       if (brainConn) {
         brainConn.ws.send(serialize({
-          type: 'result_delivery',
-          id: cmd.id,
-          status: 'completed',
+          type: 'result_delivery', id: cmd.id, status: 'completed',
           result: { queued: true, command_id: cmd.id, reason: 'Actuator offline, command queued for delivery' },
         }));
       }
+      return { commandId: cmd.id, error: 'Actuator offline, command queued' };
     }
+
+    return { commandId: cmd.id };
   }
 
   /**
@@ -112,11 +105,41 @@ export class CommandRouter {
 
     db.updateCommandStatus(this.database, msg.id, msg.status, JSON.stringify(msg.result));
 
-    // Route result to brain
+    // Resolve any pending REST sync request
+    const pending = this.pendingResults.get(msg.id);
+    if (pending) {
+      clearTimeout(pending.timer);
+      this.pendingResults.delete(msg.id);
+      pending.resolve({ status: msg.status, result: msg.result });
+    }
+
+    // Route result to brain via WS
     const brainConn = this.hub.getBrainConnection(agentId);
     if (brainConn) {
       brainConn.ws.send(serialize({ type: 'result_delivery', id: msg.id, status: msg.status, result: msg.result }));
     }
+  }
+
+  /**
+   * Wait for a command result synchronously (for REST callers without WS brain connection).
+   * Returns the result or null on timeout.
+   */
+  waitForResult(commandId: string, timeoutMs: number = 30000): Promise<{ status: string; result: any } | null> {
+    return new Promise((resolve) => {
+      // Check if already completed
+      const cmd = db.getCommandById(this.database, commandId);
+      if (cmd && (cmd.status === 'completed' || cmd.status === 'failed')) {
+        resolve({ status: cmd.status, result: cmd.result ? JSON.parse(cmd.result) : null });
+        return;
+      }
+
+      const timer = setTimeout(() => {
+        this.pendingResults.delete(commandId);
+        resolve(null);
+      }, timeoutMs);
+
+      this.pendingResults.set(commandId, { resolve, timer });
+    });
   }
 
   /**
