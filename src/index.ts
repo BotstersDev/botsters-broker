@@ -59,7 +59,6 @@ app.use('/api/*', cors());
 
 // API routes
 app.route('/v1', apiRoutes);
-app.route('', apiRoutes);
 
 // Account management API routes
 app.route('/api', accountRoutes);
@@ -67,7 +66,6 @@ app.route('/v1/api', accountRoutes);
 
 // Inference proxy routes (the spine's core capability)
 app.route('/v1', inferenceRoutes);
-app.route('', inferenceRoutes);
 
 // Web UI routes
 app.route('/', webRoutes);
