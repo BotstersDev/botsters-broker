@@ -18,6 +18,7 @@ import { inferenceRoutes } from './inference.js';
 import { webRoutes } from './web.js';
 import { WsHub } from './ws-hub.js';
 import { CommandRouter } from './command-router.js';
+import * as db from './db.js';
 import { loadConfig } from './config.js';
 import type { Env } from './types.js';
 
@@ -83,6 +84,53 @@ app.get('/v1/actuators', async (c) => {
   })));
 });
 
+// Select actuator for agent
+app.post('/v1/actuator/select', async (c) => {
+  const authHeader = c.req.header('authorization');
+  const token = authHeader?.replace(/^Bearer\s+/i, '');
+  if (!token) return c.json({ error: 'Missing auth token' }, 401);
+
+  const agent = db.getAgentByToken(database, token);
+  if (!agent) return c.json({ error: 'Invalid token' }, 401);
+
+  const body = await c.req.json<{ actuator_id: string | null }>();
+  const actuatorId = body.actuator_id;
+
+  // Validate if non-null
+  if (actuatorId) {
+    const actuator = db.getActuatorById(database, actuatorId);
+    if (!actuator || actuator.agent_id !== agent.id) {
+      return c.json({ error: 'Actuator not found or not owned by this agent' }, 404);
+    }
+  }
+
+  db.selectActuator(database, agent.id, actuatorId);
+  return c.json({ ok: true, selected_actuator_id: actuatorId });
+});
+
+// Get currently selected actuator
+app.get('/v1/actuator/selected', async (c) => {
+  const authHeader = c.req.header('authorization');
+  const token = authHeader?.replace(/^Bearer\s+/i, '');
+  if (!token) return c.json({ error: 'Missing auth token' }, 401);
+
+  const agent = db.getAgentByToken(database, token);
+  if (!agent) return c.json({ error: 'Invalid token' }, 401);
+
+  const actuator = db.getSelectedActuator(database, agent.id);
+  if (actuator) {
+    return c.json({ actuator_id: actuator.id, name: actuator.name, type: actuator.type, status: actuator.status });
+  }
+
+  // Check auto-select
+  const all = db.listActuators(database, agent.id);
+  if (all.length === 1) {
+    return c.json({ actuator_id: all[0].id, name: all[0].name, type: all[0].type, status: all[0].status, auto_selected: true });
+  }
+
+  return c.json({ actuator_id: null, message: 'No actuator selected' });
+});
+
 // Send command to actuator via REST
 app.post('/v1/command', async (c) => {
   const authHeader = c.req.header('authorization');
@@ -91,18 +139,17 @@ app.post('/v1/command', async (c) => {
   if (!token) return c.json({ error: 'Missing auth token' }, 401);
 
   // Authenticate — agent token or actuator token
-  const { getAgentByToken, getActuatorByToken, getAgentById } = await import('./db.js');
   let agentId: string;
   let accountId: string;
 
-  const agent = getAgentByToken(database, token);
+  const agent = db.getAgentByToken(database, token);
   if (agent) {
     agentId = agent.id;
     accountId = agent.account_id;
   } else if (token.startsWith('seks_actuator_')) {
-    const actuator = getActuatorByToken(database, token);
+    const actuator = db.getActuatorByToken(database, token);
     if (!actuator) return c.json({ error: 'Invalid token' }, 401);
-    const owner = getAgentById(database, actuator.agent_id);
+    const owner = db.getAgentById(database, actuator.agent_id);
     if (!owner) return c.json({ error: 'Invalid token' }, 401);
     agentId = owner.id;
     accountId = owner.account_id;
@@ -119,9 +166,6 @@ app.post('/v1/command', async (c) => {
     timeout_ms?: number;
   }>();
 
-  if (!body.actuator_id) {
-    return c.json({ error: 'actuator_id is required. Query GET /v1/actuators to discover available actuators.' }, 400);
-  }
   if (!body.capability || !body.payload) {
     return c.json({ error: 'capability and payload required' }, 400);
   }
@@ -135,8 +179,12 @@ app.post('/v1/command', async (c) => {
     ttl_seconds: body.ttl_seconds,
   });
 
+  if (!commandId && !error) {
+    // Null behavior — no valid actuator resolved
+    return c.json({ status: 'completed', result: null });
+  }
   if (!commandId) {
-    return c.json({ status: 'error', error: error || 'Command failed' }, 400);
+    return c.json({ status: 'error', error }, 400);
   }
 
   // Sync mode: wait for result and return it in the HTTP response
