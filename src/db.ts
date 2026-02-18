@@ -3,7 +3,7 @@
  */
 
 import type Database from 'better-sqlite3';
-import { generateId, generateToken, hashToken } from './crypto.js';
+import { generateId, generateToken, hashToken, encrypt } from './crypto.js';
 import type { Account, Agent, Secret, AuditEntry, Session, FakeToken, SecretAccess, Actuator, Capability, Command, CapabilityGrant } from './types.js';
 
 // ─── Accounts (formerly Clients) ──────────────────────────────────────────────
@@ -44,6 +44,10 @@ export function getAccountById(db: Database.Database, id: string): Account | nul
   return db.prepare('SELECT * FROM accounts WHERE id = ?').get(id) as Account | undefined ?? null;
 }
 
+export function listAccounts(db: Database.Database): Account[] {
+  return db.prepare('SELECT * FROM accounts ORDER BY created_at DESC').all() as Account[];
+}
+
 // Backwards compat aliases
 export const createClient = createAccount;
 export const getClientByEmail = getAccountByEmail;
@@ -51,17 +55,18 @@ export const getClientById = getAccountById;
 
 // ─── Agents ────────────────────────────────────────────────────────────────────
 
-export function createAgent(db: Database.Database, accountId: string, name: string): Agent & { _plaintext_token: string } {
+export function createAgent(db: Database.Database, accountId: string, name: string, masterKey?: string): Agent & { _plaintext_token: string } {
   const id = `agent_${generateId().split('-')[0]}`;
   const plaintextToken = generateToken('seks_agent');
   const tokenHash = hashToken(plaintextToken);
+  const encryptedToken = masterKey ? encrypt(plaintextToken, masterKey) : null;
   const now = new Date().toISOString();
 
   db.prepare(
-    'INSERT INTO agents (id, account_id, name, token_hash, scopes, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-  ).run(id, accountId, name, tokenHash, '[]', now);
+    'INSERT INTO agents (id, account_id, name, token_hash, encrypted_token, scopes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).run(id, accountId, name, tokenHash, encryptedToken, '[]', now);
 
-  const agent = { id, account_id: accountId, name, token_hash: tokenHash, scopes: '[]', created_at: now, last_seen_at: null, _plaintext_token: plaintextToken };
+  const agent = { id, account_id: accountId, name, token_hash: tokenHash, encrypted_token: encryptedToken, scopes: '[]', created_at: now, last_seen_at: null, _plaintext_token: plaintextToken };
 
   // Auto-create null actuator for new agents
   ensureNullActuator(db, id);
@@ -95,12 +100,13 @@ export function deleteAgent(db: Database.Database, id: string, accountId: string
   db.prepare('DELETE FROM agents WHERE id = ? AND account_id = ?').run(id, accountId);
 }
 
-export function rotateAgentToken(db: Database.Database, id: string, accountId: string): { token: string; tokenHash: string } | null {
+export function rotateAgentToken(db: Database.Database, id: string, accountId: string, masterKey?: string): { token: string; tokenHash: string } | null {
   const agent = db.prepare('SELECT * FROM agents WHERE id = ? AND account_id = ?').get(id, accountId) as Agent | undefined;
   if (!agent) return null;
   const newToken = generateToken('seks_agent');
   const newHash = hashToken(newToken);
-  db.prepare('UPDATE agents SET token_hash = ? WHERE id = ?').run(newHash, id);
+  const encryptedToken = masterKey ? encrypt(newToken, masterKey) : null;
+  db.prepare('UPDATE agents SET token_hash = ?, encrypted_token = ? WHERE id = ?').run(newHash, encryptedToken, id);
   return { token: newToken, tokenHash: newHash };
 }
 
@@ -321,6 +327,20 @@ export function listActuatorsByAccount(db: Database.Database, accountId: string)
 
 export function deleteActuator(db: Database.Database, id: string): void {
   db.prepare('DELETE FROM actuators WHERE id = ?').run(id);
+}
+
+export function rotateActuatorToken(db: Database.Database, id: string, masterKey?: string): { token: string; tokenHash: string } | null {
+  const actuator = db.prepare('SELECT * FROM actuators WHERE id = ?').get(id) as Actuator | undefined;
+  if (!actuator) return null;
+  const newToken = generateToken('seks_actuator');
+  const newHash = hashToken(newToken);
+  const encryptedToken = masterKey ? encrypt(newToken, masterKey) : null;
+  db.prepare('UPDATE actuators SET token_hash = ?, encrypted_token = ? WHERE id = ?').run(newHash, encryptedToken, id);
+  return { token: newToken, tokenHash: newHash };
+}
+
+export function getActuatorByTokenHash(db: Database.Database, tokenHash: string): Actuator | null {
+  return db.prepare('SELECT * FROM actuators WHERE token_hash = ?').get(tokenHash) as Actuator | undefined ?? null;
 }
 
 export function updateActuatorStatus(db: Database.Database, id: string, status: string): void {
