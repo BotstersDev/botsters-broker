@@ -12,6 +12,18 @@ import { decrypt } from './crypto.js';
 
 export const inferenceRoutes = new Hono<{ Bindings: Env }>();
 
+// ─── Round-Robin State ─────────────────────────────────────────────────────────
+// In-memory counter per provider for round-robin token rotation.
+// Resets on process restart (fine — no need for persistence).
+const roundRobinCounters = new Map<string, number>();
+
+function nextRoundRobin(provider: string, total: number): number {
+  const current = roundRobinCounters.get(provider) ?? 0;
+  const next = (current + 1) % total;
+  roundRobinCounters.set(provider, next);
+  return current;
+}
+
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
 interface InferenceRequest {
@@ -322,131 +334,186 @@ inferenceRoutes.post('/inference', async (c) => {
 // Authorization header; the broker swaps it for the real API key.
 
 /**
- * Resolve API key for a provider, given an authenticated agent.
- * Tries capability grants first, falls back to direct secret lookup.
+ * Resolve ALL API keys for a provider, given an authenticated agent.
+ * Returns an array of decrypted keys for round-robin use.
+ * Tries capability grants first, falls back to secret lookup by prefix.
  */
-function resolveProviderKey(c: any, agent: Agent, provider: string): { apiKey: string } | { error: string; status: number } {
+function resolveProviderKeys(c: any, agent: Agent, provider: string): { apiKeys: string[] } | { error: string; status: number } {
   const providerConfig = PROVIDERS[provider];
   if (!providerConfig) {
     return { error: `Unsupported provider: ${provider}`, status: 400 };
   }
 
+  // First try capability grants (single key path — for explicit per-agent grants)
   const secretId = db.resolveCapability(c.env.db, agent.id, 'inference', provider);
   if (secretId) {
     const secret = db.getSecretById(c.env.db, secretId, agent.account_id);
     if (!secret) return { error: 'API key not found', status: 404 };
     try {
-      return { apiKey: decrypt(secret.encrypted_value, c.env.masterKey) };
+      return { apiKeys: [decrypt(secret.encrypted_value, c.env.masterKey)] };
     } catch {
       return { error: 'Failed to decrypt API key', status: 500 };
     }
   }
 
-  const secret = db.getSecret(c.env.db, agent.account_id, providerConfig.secretName, agent.id);
-  if (!secret) return { error: `No ${provider} API key configured`, status: 404 };
-  try {
-    return { apiKey: decrypt(secret.encrypted_value, c.env.masterKey) };
-  } catch {
-    return { error: 'Failed to decrypt API key', status: 500 };
+  // Fall back: find ALL secrets matching the provider's secret name prefix
+  // e.g. ANTHROPIC_TOKEN, ANTHROPIC_TOKEN_2, ANTHROPIC_TOKEN_3, ...
+  const secrets = db.getSecretsByPrefix(c.env.db, agent.account_id, providerConfig.secretName, agent.id);
+  if (secrets.length === 0) {
+    return { error: `No ${provider} API key configured. Store secret '${providerConfig.secretName}' in the broker.`, status: 404 };
   }
+
+  const apiKeys: string[] = [];
+  for (const secret of secrets) {
+    try {
+      apiKeys.push(decrypt(secret.encrypted_value, c.env.masterKey));
+    } catch {
+      // Skip bad keys, log warning
+      db.logAudit(c.env.db, agent.account_id, agent.id, 'key.decrypt_error', `inference/${provider}`, 'error', null,
+        `Failed to decrypt secret ${secret.name}`);
+    }
+  }
+
+  if (apiKeys.length === 0) {
+    return { error: 'Failed to decrypt any API keys', status: 500 };
+  }
+
+  return { apiKeys };
+}
+
+/** Pick one key via round-robin from a resolved set */
+function pickKey(provider: string, apiKeys: string[]): string {
+  if (apiKeys.length === 1) return apiKeys[0];
+  const idx = nextRoundRobin(provider, apiKeys.length);
+  return apiKeys[idx];
+}
+
+/** Legacy single-key resolver (for the /inference endpoint that doesn't retry) */
+function resolveProviderKey(c: any, agent: Agent, provider: string): { apiKey: string } | { error: string; status: number } {
+  const result = resolveProviderKeys(c, agent, provider);
+  if ('error' in result) return result;
+  return { apiKey: pickKey(provider, result.apiKeys) };
 }
 
 // Anthropic transparent proxy: POST /v1/proxy/anthropic/v1/messages
+// Supports round-robin across multiple ANTHROPIC_TOKEN secrets with 429 retry.
 inferenceRoutes.post('/proxy/anthropic/*', async (c) => {
   const startTime = Date.now();
   const agent = authenticateAgent(c);
   if (!agent) return c.json({ error: 'Unauthorized' }, 401);
 
-  const result = resolveProviderKey(c, agent, 'anthropic');
+  const result = resolveProviderKeys(c, agent, 'anthropic');
   if ('error' in result) {
     db.logAudit(c.env.db, agent.account_id, agent.id, 'proxy.request', 'inference/anthropic', 'denied', null, result.error);
     return c.json({ error: result.error }, result.status as any);
   }
 
-  // Build the real Anthropic URL from the path suffix
-  const fullPath = c.req.path;  // e.g. /v1/proxy/anthropic/v1/messages
+  const { apiKeys } = result;
+  const fullPath = c.req.path;
   const providerPath = fullPath.replace(/^\/v1\/proxy\/anthropic/, '');
   const url = `https://api.anthropic.com${providerPath}`;
 
-  // Build auth headers based on token type
-  const authHeaders = buildAnthropicAuthHeaders(result.apiKey);
-
-  // Forward the request body and relevant headers
   const requestBody = await c.req.raw.clone().text();
   const contentType = c.req.header('content-type') || 'application/json';
 
-  // Extract model from body for audit (best effort)
   let model = 'unknown';
   try { model = JSON.parse(requestBody).model || 'unknown'; } catch {}
 
-  db.logAudit(c.env.db, agent.account_id, agent.id, 'proxy.request', 'inference/anthropic', 'pending', null,
-    JSON.stringify({ model, path: providerPath }));
-
-  const headers: Record<string, string> = {
-    'Content-Type': contentType,
-    ...authHeaders,
-  };
-
   // Forward anthropic-beta and anthropic-version from client if present
   const clientBeta = c.req.header('anthropic-beta');
-  if (clientBeta) {
-    // Merge with our auth beta header if both exist
-    if (headers['anthropic-beta'] && clientBeta !== headers['anthropic-beta']) {
-      headers['anthropic-beta'] = `${headers['anthropic-beta']},${clientBeta}`;
-    } else {
-      headers['anthropic-beta'] = clientBeta;
-    }
-  }
   const clientVersion = c.req.header('anthropic-version');
-  if (clientVersion) headers['anthropic-version'] = clientVersion;
 
-  try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: requestBody,
-    });
+  // Try up to N keys (round-robin start, retry on 429)
+  const maxAttempts = Math.min(apiKeys.length, 5); // cap retries at 5
+  let lastError: Response | null = null;
 
-    const latencyMs = Date.now() - startTime;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const apiKey = pickKey('anthropic', apiKeys);
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      db.logAudit(c.env.db, agent.account_id, agent.id, 'proxy.error', 'inference/anthropic', 'error', null,
-        JSON.stringify({ model, status: response.status, latencyMs }));
-      return new Response(errorText, {
-        status: response.status,
+    const authHeaders = buildAnthropicAuthHeaders(apiKey);
+    const headers: Record<string, string> = {
+      'Content-Type': contentType,
+      ...authHeaders,
+    };
+
+    if (clientBeta) {
+      if (headers['anthropic-beta'] && clientBeta !== headers['anthropic-beta']) {
+        headers['anthropic-beta'] = `${headers['anthropic-beta']},${clientBeta}`;
+      } else {
+        headers['anthropic-beta'] = clientBeta;
+      }
+    }
+    if (clientVersion) headers['anthropic-version'] = clientVersion;
+
+    db.logAudit(c.env.db, agent.account_id, agent.id, 'proxy.request', 'inference/anthropic', 'pending', null,
+      JSON.stringify({ model, path: providerPath, attempt: attempt + 1, totalKeys: apiKeys.length }));
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: requestBody,
+      });
+
+      const latencyMs = Date.now() - startTime;
+
+      // On 429 (rate limit) or 529 (overloaded), try the next key
+      if ((response.status === 429 || response.status === 529) && attempt < maxAttempts - 1) {
+        const errorText = await response.text();
+        db.logAudit(c.env.db, agent.account_id, agent.id, 'proxy.rate_limited', 'inference/anthropic', 'retry', null,
+          JSON.stringify({ model, status: response.status, attempt: attempt + 1, latencyMs }));
+        lastError = new Response(errorText, {
+          status: response.status,
+          headers: { 'Content-Type': response.headers.get('Content-Type') || 'application/json' },
+        });
+        continue;
+      }
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        db.logAudit(c.env.db, agent.account_id, agent.id, 'proxy.error', 'inference/anthropic', 'error', null,
+          JSON.stringify({ model, status: response.status, latencyMs }));
+        return new Response(errorText, {
+          status: response.status,
+          headers: { 'Content-Type': response.headers.get('Content-Type') || 'application/json' },
+        });
+      }
+
+      // SSE streaming passthrough
+      if (response.headers.get('Content-Type')?.includes('text/event-stream')) {
+        db.logAudit(c.env.db, agent.account_id, agent.id, 'proxy.streaming', 'inference/anthropic', 'success', null,
+          JSON.stringify({ model, latencyMs, keyIndex: attempt + 1, totalKeys: apiKeys.length }));
+        return new Response(response.body, {
+          status: 200,
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+          },
+        });
+      }
+
+      // Non-streaming passthrough
+      const responseBody = await response.text();
+      db.logAudit(c.env.db, agent.account_id, agent.id, 'proxy.complete', 'inference/anthropic', 'success', null,
+        JSON.stringify({ model, latencyMs, keyIndex: attempt + 1, totalKeys: apiKeys.length }));
+      return new Response(responseBody, {
+        status: 200,
         headers: { 'Content-Type': response.headers.get('Content-Type') || 'application/json' },
       });
+    } catch (e) {
+      const error = e instanceof Error ? e.message : 'Unknown error';
+      db.logAudit(c.env.db, agent.account_id, agent.id, 'proxy.error', 'inference/anthropic', 'error', null,
+        JSON.stringify({ model, error, attempt: attempt + 1 }));
+      if (attempt === maxAttempts - 1) {
+        return c.json({ error: `Provider request failed: ${error}` }, 502);
+      }
     }
-
-    // SSE streaming passthrough
-    if (response.headers.get('Content-Type')?.includes('text/event-stream')) {
-      db.logAudit(c.env.db, agent.account_id, agent.id, 'proxy.streaming', 'inference/anthropic', 'success', null,
-        JSON.stringify({ model, latencyMs }));
-      return new Response(response.body, {
-        status: 200,
-        headers: {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          'Connection': 'keep-alive',
-        },
-      });
-    }
-
-    // Non-streaming passthrough
-    const responseBody = await response.text();
-    db.logAudit(c.env.db, agent.account_id, agent.id, 'proxy.complete', 'inference/anthropic', 'success', null,
-      JSON.stringify({ model, latencyMs }));
-    return new Response(responseBody, {
-      status: 200,
-      headers: { 'Content-Type': response.headers.get('Content-Type') || 'application/json' },
-    });
-  } catch (e) {
-    const error = e instanceof Error ? e.message : 'Unknown error';
-    db.logAudit(c.env.db, agent.account_id, agent.id, 'proxy.error', 'inference/anthropic', 'error', null,
-      JSON.stringify({ model, error }));
-    return c.json({ error: `Provider request failed: ${error}` }, 502);
   }
+
+  // All keys exhausted — return the last 429/529
+  if (lastError) return lastError;
+  return c.json({ error: 'All provider keys exhausted' }, 429);
 });
 
 // OpenAI transparent proxy: POST /v1/proxy/openai/*

@@ -115,6 +115,22 @@ export function createSecret(db: Database.Database, accountId: string, name: str
   return { id, account_id: accountId, name, provider, encrypted_value: encryptedValue, metadata: null, created_at: now, updated_at: now };
 }
 
+export function getSecretsByPrefix(db: Database.Database, accountId: string, namePrefix: string, agentId?: string): Secret[] {
+  const pattern = `${namePrefix}%`;
+  if (agentId) {
+    return db.prepare(`
+      SELECT s.* FROM secrets s
+      WHERE s.account_id = ? AND s.name LIKE ?
+        AND (
+          NOT EXISTS (SELECT 1 FROM secret_access sa WHERE sa.secret_id = s.id)
+          OR EXISTS (SELECT 1 FROM secret_access sa WHERE sa.secret_id = s.id AND sa.agent_id = ?)
+        )
+      ORDER BY s.name
+    `).all(accountId, pattern, agentId) as Secret[];
+  }
+  return db.prepare('SELECT * FROM secrets WHERE account_id = ? AND name LIKE ? ORDER BY name').all(accountId, pattern) as Secret[];
+}
+
 export function getSecret(db: Database.Database, accountId: string, name: string, agentId?: string): Secret | null {
   if (agentId) {
     return db.prepare(`
