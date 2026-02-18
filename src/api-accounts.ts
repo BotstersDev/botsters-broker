@@ -28,6 +28,15 @@ function requireAdmin(c: any): Response | null {
 
 // ─── Account CRUD ──────────────────────────────────────────────────────────────
 
+// GET /api/accounts — list all accounts
+accountRoutes.get('/accounts', (c) => {
+  const denied = requireAdmin(c);
+  if (denied) return denied;
+
+  const accounts = db.listAccounts(c.env.db);
+  return c.json({ ok: true, accounts: accounts.map(a => ({ id: a.id, email: a.email, name: a.name, plan: a.plan, status: a.status, created_at: a.created_at })) });
+});
+
 // POST /api/accounts — create account
 accountRoutes.post('/accounts', async (c) => {
   const denied = requireAdmin(c);
@@ -103,7 +112,7 @@ accountRoutes.post('/accounts/:id/agents', async (c) => {
   const body = await c.req.json<{ name: string }>();
   if (!body.name) return c.json({ ok: false, error: 'Missing name' }, 400);
 
-  const agent = db.createAgent(c.env.db, accountId, body.name);
+  const agent = db.createAgent(c.env.db, accountId, body.name, c.env.masterKey);
   db.logAudit(c.env.db, accountId, agent.id, 'agent.create', null, 'success');
 
   return c.json({ ok: true, agent: { id: agent.id, name: agent.name, token: agent._plaintext_token, created_at: agent.created_at } }, 201);
@@ -142,7 +151,7 @@ accountRoutes.post('/accounts/:id/agents/:agentId/rotate-token', (c) => {
 
   const accountId = c.req.param('id');
   const agentId = c.req.param('agentId');
-  const result = db.rotateAgentToken(c.env.db, agentId, accountId);
+  const result = db.rotateAgentToken(c.env.db, agentId, accountId, c.env.masterKey);
   if (!result) return c.json({ ok: false, error: 'Agent not found' }, 404);
 
   db.logAudit(c.env.db, accountId, agentId, 'agent.rotate-token', null, 'success');
@@ -391,7 +400,7 @@ accountRoutes.post('/provision', async (c) => {
   }
 
   // Create default agent
-  const agent = db.createAgent(c.env.db, account.id, 'default');
+  const agent = db.createAgent(c.env.db, account.id, 'default', c.env.masterKey);
 
   db.logAudit(c.env.db, account.id, agent.id, 'provision.create', null, 'success');
 
