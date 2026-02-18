@@ -35,6 +35,7 @@ export interface Agent {
   created_at: string;
   last_seen_at: string | null;
   encrypted_token: string | null;
+  selected_actuator_id: string | null;
   // transient: plaintext token only available at creation time
   _plaintext_token?: string;
 }

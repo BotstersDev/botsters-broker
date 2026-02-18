@@ -66,10 +66,7 @@ export function createAgent(db: Database.Database, accountId: string, name: stri
     'INSERT INTO agents (id, account_id, name, token_hash, encrypted_token, scopes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
   ).run(id, accountId, name, tokenHash, encryptedToken, '[]', now);
 
-  const agent = { id, account_id: accountId, name, token_hash: tokenHash, encrypted_token: encryptedToken, scopes: '[]', created_at: now, last_seen_at: null, _plaintext_token: plaintextToken };
-
-  // Auto-create null actuator for new agents
-  ensureNullActuator(db, id);
+  const agent = { id, account_id: accountId, name, token_hash: tokenHash, encrypted_token: encryptedToken, scopes: '[]', created_at: now, last_seen_at: null, selected_actuator_id: null, _plaintext_token: plaintextToken };
 
   return agent;
 }
@@ -280,25 +277,45 @@ export function setSecretAccess(db: Database.Database, secretId: string, agentId
 
 // ─── Actuators ─────────────────────────────────────────────────────────────────
 
-/** Well-known null actuator ID — commands sent here are acknowledged but not executed */
-export const NULL_ACTUATOR_ID = 'actuator_null';
+// ─── Actuator Selection ────────────────────────────────────────────────────────
 
-/**
- * Ensure the null actuator exists for a given agent.
- * The null actuator is a /dev/null equivalent — commands are accepted and immediately
- * completed with exit code 0 and empty output. Safe default for unconfigured agents.
- */
-export function ensureNullActuator(db: Database.Database, agentId: string): Actuator {
-  const existing = db.prepare('SELECT * FROM actuators WHERE id = ? AND agent_id = ?').get(`${NULL_ACTUATOR_ID}_${agentId}`, agentId) as Actuator | undefined;
-  if (existing) return existing;
-  const id = `${NULL_ACTUATOR_ID}_${agentId}`;
-  const now = new Date().toISOString();
-  db.prepare('INSERT INTO actuators (id, agent_id, name, type, status, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, agentId, '/dev/null', 'null', 'online', now);
-  return { id, agent_id: agentId, name: '/dev/null', type: 'null', status: 'online', last_seen_at: null, created_at: now, token_hash: null, encrypted_token: null };
+export function selectActuator(db: Database.Database, agentId: string, actuatorId: string | null): void {
+  db.prepare('UPDATE agents SET selected_actuator_id = ? WHERE id = ?').run(actuatorId, agentId);
 }
 
-export function isNullActuator(actuatorId: string): boolean {
-  return actuatorId.startsWith(NULL_ACTUATOR_ID);
+export function getSelectedActuator(db: Database.Database, agentId: string): Actuator | null {
+  const agent = db.prepare('SELECT selected_actuator_id FROM agents WHERE id = ?').get(agentId) as { selected_actuator_id: string | null } | undefined;
+  if (!agent?.selected_actuator_id) return null;
+  return db.prepare('SELECT * FROM actuators WHERE id = ?').get(agent.selected_actuator_id) as Actuator | undefined ?? null;
+}
+
+/**
+ * Resolve which actuator to use for a command. Resolution chain:
+ * 1. Explicit actuator_id (if provided) — invalid = null behavior, no fallthrough
+ * 2. Persisted selection — if set but invalid = null behavior, no fallthrough
+ * 3. Auto-select — ONLY if no selection exists AND agent has exactly one real actuator
+ * 4. Null behavior — return null
+ */
+export function resolveActuatorForAgent(db: Database.Database, agentId: string, explicitId?: string): Actuator | null {
+  // Step 1: explicit override
+  if (explicitId) {
+    const actuator = db.prepare('SELECT * FROM actuators WHERE id = ? AND agent_id = ?').get(explicitId, agentId) as Actuator | undefined;
+    return actuator ?? null; // invalid explicit = null, no fallthrough
+  }
+
+  // Step 2: persisted selection
+  const agent = db.prepare('SELECT selected_actuator_id FROM agents WHERE id = ?').get(agentId) as { selected_actuator_id: string | null } | undefined;
+  if (agent?.selected_actuator_id) {
+    const actuator = db.prepare('SELECT * FROM actuators WHERE id = ? AND agent_id = ?').get(agent.selected_actuator_id, agentId) as Actuator | undefined;
+    return actuator ?? null; // invalid selection = null, no fallthrough
+  }
+
+  // Step 3: auto-select (only if no selection at all)
+  const actuators = db.prepare('SELECT * FROM actuators WHERE agent_id = ?').all(agentId) as Actuator[];
+  if (actuators.length === 1) return actuators[0];
+
+  // Step 4: null behavior
+  return null;
 }
 
 export function createActuator(db: Database.Database, agentId: string, name: string, type: string = 'vps'): Actuator {

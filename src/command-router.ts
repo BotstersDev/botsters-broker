@@ -5,7 +5,6 @@
 import type Database from 'better-sqlite3';
 import type { WsHub } from './ws-hub.js';
 import * as db from './db.js';
-import { isNullActuator } from './db.js';
 import { decrypt } from './crypto.js';
 import type { CommandRequest, CommandResult, CredentialRequest } from './protocol.js';
 import { serialize, makeError } from './protocol.js';
@@ -29,56 +28,32 @@ export class CommandRouter {
   handleCommandRequest(agentId: string, accountId: string, msg: CommandRequest): { commandId: string | null; error?: string } {
     const brainConn = this.hub.getBrainConnection(agentId);
 
-    // actuator_id is required — no implicit routing
-    if (!msg.actuator_id || msg.actuator_id === '*') {
-      const err = 'actuator_id is required. Query GET /v1/actuators to discover available actuators.';
-      if (brainConn) brainConn.ws.send(serialize(makeError('actuator_required', err, msg.id)));
-      return { commandId: null, error: err };
-    }
+    // Resolve actuator through the selection chain
+    const actuator = db.resolveActuatorForAgent(this.database, agentId, msg.actuator_id || undefined);
 
-    const actuatorId = msg.actuator_id;
-
-    // Null actuator: immediately complete with empty success
-    if (isNullActuator(actuatorId)) {
-      const cmd = db.createCommand(this.database, agentId, actuatorId, msg.capability, JSON.stringify(msg.payload), 0);
-      db.updateCommandStatus(this.database, cmd.id, 'completed', JSON.stringify({ stdout: '', stderr: '', exitCode: 0, null_actuator: true }));
+    // Null behavior: no valid actuator resolved
+    if (!actuator) {
       if (brainConn) {
         brainConn.ws.send(serialize({
-          type: 'result_delivery', id: cmd.id, status: 'completed',
-          result: { stdout: '', stderr: '', exitCode: 0, null_actuator: true },
+          type: 'result_delivery', id: msg.id, status: 'completed', result: null,
         }));
       }
-      return { commandId: cmd.id };
-    }
-
-    // Look up the actuator
-    const actuator = db.getActuatorById(this.database, actuatorId);
-    if (!actuator) {
-      const err = `Actuator ${actuatorId} not found`;
-      if (brainConn) brainConn.ws.send(serialize(makeError('not_found', err, msg.id)));
-      return { commandId: null, error: err };
-    }
-
-    // Verify the actuator belongs to this agent
-    if (actuator.agent_id !== agentId) {
-      const err = 'Actuator does not belong to this agent';
-      if (brainConn) brainConn.ws.send(serialize(makeError('forbidden', err, msg.id)));
-      return { commandId: null, error: err };
+      return { commandId: null };
     }
 
     // Verify the actuator has the requested capability
-    const caps = db.listCapabilities(this.database, actuatorId);
+    const caps = db.listCapabilities(this.database, actuator.id);
     if (!caps.some(c => c.capability === msg.capability)) {
-      const err = `Actuator ${actuatorId} lacks capability: ${msg.capability}. Available: ${caps.map(c => c.capability).join(', ') || 'none'}`;
+      const err = `Actuator ${actuator.id} lacks capability: ${msg.capability}. Available: ${caps.map(c => c.capability).join(', ') || 'none'}`;
       if (brainConn) brainConn.ws.send(serialize(makeError('no_capability', err, msg.id)));
       return { commandId: null, error: err };
     }
 
     // Create command record
-    const cmd = db.createCommand(this.database, agentId, actuatorId, msg.capability, JSON.stringify(msg.payload), msg.ttl_seconds ?? 300);
+    const cmd = db.createCommand(this.database, agentId, actuator.id, msg.capability, JSON.stringify(msg.payload), msg.ttl_seconds ?? 300);
 
     // Try to deliver
-    const actuatorConn = this.hub.getActuatorConnection(agentId, actuatorId);
+    const actuatorConn = this.hub.getActuatorConnection(agentId, actuator.id);
     if (actuatorConn) {
       actuatorConn.ws.send(serialize({ type: 'command_delivery', id: cmd.id, capability: msg.capability, payload: msg.payload }));
       db.updateCommandStatus(this.database, cmd.id, 'delivered');
