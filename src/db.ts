@@ -202,7 +202,7 @@ export function logAudit(db: Database.Database, accountId: string, agentId: stri
   ).run(id, accountId, agentId, action, resource, status, ipAddress ?? null, details ?? null, now);
 }
 
-export function listAudit(db: Database.Database, accountId: string, opts?: { limit?: number; action?: string; after?: string; before?: string }): (AuditEntry & { agent_name?: string })[] {
+export function listAudit(db: Database.Database, accountId: string, opts?: { limit?: number; action?: string; agentId?: string; after?: string; before?: string }): (AuditEntry & { agent_name?: string })[] {
   const limit = opts?.limit ?? 200;
   const conditions = ['a.account_id = ?'];
   const params: (string | number)[] = [accountId];
@@ -210,6 +210,10 @@ export function listAudit(db: Database.Database, accountId: string, opts?: { lim
   if (opts?.action) {
     conditions.push('a.action = ?');
     params.push(opts.action);
+  }
+  if (opts?.agentId) {
+    conditions.push('a.agent_id = ?');
+    params.push(opts.agentId);
   }
   if (opts?.after) {
     conditions.push('a.created_at >= ?');

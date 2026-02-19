@@ -991,10 +991,14 @@ webRoutes.get('/activity', (c) => {
 
   // Parse query params for filtering
   const actionFilter = c.req.query('action') || '';
+  const agentFilter = c.req.query('agent') || '';
   const afterFilter = c.req.query('after') || '';
   const beforeFilter = c.req.query('before') || '';
   const limitParam = parseInt(c.req.query('limit') || '200', 10);
   const limit = Math.max(limitParam, 1);
+
+  // Get all agents for the filter dropdown
+  const agents = db.listAgents(c.env.db, accountId);
 
   // Timezone: query param > cookie > default (America/Los_Angeles)
   const TIMEZONES = [
@@ -1009,6 +1013,7 @@ webRoutes.get('/activity', (c) => {
   const entries = db.listAudit(c.env.db, accountId, {
     limit,
     action: actionFilter || undefined,
+    agentId: agentFilter || undefined,
     after: afterFilter || undefined,
     before: beforeFilter || undefined,
   });
@@ -1059,6 +1064,13 @@ webRoutes.get('/activity', (c) => {
               <select name="action" style="padding:0.4rem 0.6rem;border-radius:4px;border:1px solid #444;background:#1a1a2e;color:#e0e0e0">
                 <option value="">All</option>
                 ${raw(actionTypes.map(a => html`<option value="${a}" ${a === actionFilter ? 'selected' : ''}>${a}</option>`).join(''))}
+              </select>
+            </div>
+            <div>
+              <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;color:#888">Agent</label>
+              <select name="agent" style="padding:0.4rem 0.6rem;border-radius:4px;border:1px solid #444;background:#1a1a2e;color:#e0e0e0">
+                <option value="">All</option>
+                ${raw(agents.map(a => html`<option value="${a.id}" ${a.id === agentFilter ? 'selected' : ''}>${a.name || a.id}</option>`).join(''))}
               </select>
             </div>
             <div>
