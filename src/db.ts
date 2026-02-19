@@ -208,8 +208,8 @@ export function listAudit(db: Database.Database, accountId: string, opts?: { lim
   const params: (string | number)[] = [accountId];
 
   if (opts?.action) {
-    conditions.push('a.action LIKE ?');
-    params.push(`%${opts.action}%`);
+    conditions.push('a.action = ?');
+    params.push(opts.action);
   }
   if (opts?.after) {
     conditions.push('a.created_at >= ?');
