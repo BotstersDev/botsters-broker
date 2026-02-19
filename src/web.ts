@@ -994,7 +994,7 @@ webRoutes.get('/activity', (c) => {
   const afterFilter = c.req.query('after') || '';
   const beforeFilter = c.req.query('before') || '';
   const limitParam = parseInt(c.req.query('limit') || '200', 10);
-  const limit = Math.min(Math.max(limitParam, 10), 1000);
+  const limit = Math.max(limitParam, 1);
 
   // Timezone: query param > cookie > default (America/Los_Angeles)
   const TIMEZONES = [
@@ -1077,7 +1077,7 @@ webRoutes.get('/activity', (c) => {
             </div>
             <div>
               <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;color:#888">Limit</label>
-              <input type="number" name="limit" value="${limit}" min="10" max="1000" step="50" style="width:5rem;padding:0.4rem 0.6rem;border-radius:4px;border:1px solid #444;background:#1a1a2e;color:#e0e0e0" />
+              <input type="number" name="limit" value="${limit}" min="1" max="10000" step="1" style="width:5rem;padding:0.4rem 0.6rem;border-radius:4px;border:1px solid #444;background:#1a1a2e;color:#e0e0e0" />
             </div>
             <button type="submit" style="padding:0.4rem 1rem;border-radius:4px;border:none;background:#4a6cf7;color:white;cursor:pointer">Filter</button>
             <a href="/activity" style="padding:0.4rem 0.8rem;color:#888;text-decoration:none;font-size:0.85rem">Reset</a>
