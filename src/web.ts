@@ -989,28 +989,85 @@ webRoutes.get('/activity', (c) => {
   const accountId = getSessionAccount(c);
   if (!accountId) return redirect('/login');
 
-  const entries = db.listAudit(c.env.db, accountId, 100);
+  // Parse query params for filtering
+  const actionFilter = c.req.query('action') || '';
+  const afterFilter = c.req.query('after') || '';
+  const beforeFilter = c.req.query('before') || '';
+  const limitParam = parseInt(c.req.query('limit') || '200', 10);
+  const limit = Math.min(Math.max(limitParam, 10), 1000);
 
-  const rows = raw(entries.map(e => html`
+  const entries = db.listAudit(c.env.db, accountId, {
+    limit,
+    action: actionFilter || undefined,
+    after: afterFilter || undefined,
+    before: beforeFilter || undefined,
+  });
+
+  // Collect unique action types for the filter dropdown
+  const actionTypes = [...new Set(entries.map(e => e.action))].sort();
+
+  const rows = raw(entries.map(e => {
+    const agentLabel = e.agent_name || e.agent_id || '-';
+    const agentTitle = e.agent_id ? `ID: ${e.agent_id}` : '';
+    const statusClass = e.status === 'success' ? 'badge-success'
+      : e.status === 'error' ? 'badge-danger'
+      : e.status === 'denied' ? 'badge-danger'
+      : e.status === 'retry' ? 'badge-warning'
+      : 'badge-muted';
+    const ts = e.created_at.replace('T', ' ').split('.')[0];
+    return html`
     <tr>
-      <td class="text-muted">${e.created_at.replace('T', ' ').split('.')[0]}</td>
-      <td>${e.agent_id || '-'}</td>
-      <td>${e.action}</td>
+      <td class="text-muted" style="white-space:nowrap">${ts}</td>
+      <td title="${agentTitle}"><strong>${agentLabel}</strong></td>
+      <td><code>${e.action}</code></td>
       <td>${e.resource ? html`<code class="token">${e.resource}</code>` : '-'}</td>
-      <td><span class="badge ${e.status === 'success' ? 'badge-success' : 'badge-muted'}">${e.status}</span></td>
-    </tr>
-  `).join(''));
+      <td><span class="badge ${statusClass}">${e.status}</span></td>
+      <td class="text-muted" style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${e.details || ''}">${e.details || '-'}</td>
+    </tr>`;
+  }).join(''));
 
   const content = html`
     <main>
       <div class="container">
         <h1>Activity Log</h1>
+
+        <div class="card" style="margin-bottom:1rem;padding:1rem">
+          <form method="GET" action="/activity" style="display:flex;gap:0.75rem;align-items:flex-end;flex-wrap:wrap">
+            <div>
+              <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;color:#888">Action Type</label>
+              <select name="action" style="padding:0.4rem 0.6rem;border-radius:4px;border:1px solid #444;background:#1a1a2e;color:#e0e0e0">
+                <option value="">All</option>
+                ${raw(actionTypes.map(a => html`<option value="${a}" ${a === actionFilter ? 'selected' : ''}>${a}</option>`).join(''))}
+              </select>
+            </div>
+            <div>
+              <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;color:#888">After</label>
+              <input type="datetime-local" name="after" value="${afterFilter ? afterFilter.slice(0,16) : ''}" style="padding:0.4rem 0.6rem;border-radius:4px;border:1px solid #444;background:#1a1a2e;color:#e0e0e0" />
+            </div>
+            <div>
+              <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;color:#888">Before</label>
+              <input type="datetime-local" name="before" value="${beforeFilter ? beforeFilter.slice(0,16) : ''}" style="padding:0.4rem 0.6rem;border-radius:4px;border:1px solid #444;background:#1a1a2e;color:#e0e0e0" />
+            </div>
+            <div>
+              <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;color:#888">Limit</label>
+              <input type="number" name="limit" value="${limit}" min="10" max="1000" step="50" style="width:5rem;padding:0.4rem 0.6rem;border-radius:4px;border:1px solid #444;background:#1a1a2e;color:#e0e0e0" />
+            </div>
+            <button type="submit" style="padding:0.4rem 1rem;border-radius:4px;border:none;background:#4a6cf7;color:white;cursor:pointer">Filter</button>
+            <a href="/activity" style="padding:0.4rem 0.8rem;color:#888;text-decoration:none;font-size:0.85rem">Reset</a>
+          </form>
+        </div>
+
         <div class="card">
-          ${entries.length === 0 ? html`<div class="empty"><p>No activity recorded yet</p></div>` : html`
-            <table>
-              <thead><tr><th>Time</th><th>Agent</th><th>Action</th><th>Resource</th><th>Status</th></tr></thead>
-              <tbody>${rows}</tbody>
-            </table>
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:0.5rem 0;margin-bottom:0.5rem">
+            <span class="text-muted" style="font-size:0.85rem">Showing ${entries.length} entries (newest first)</span>
+          </div>
+          ${entries.length === 0 ? html`<div class="empty"><p>No activity matches your filters</p></div>` : html`
+            <div style="overflow-x:auto">
+              <table>
+                <thead><tr><th>Time</th><th>Agent</th><th>Action</th><th>Resource</th><th>Status</th><th>Details</th></tr></thead>
+                <tbody>${rows}</tbody>
+              </table>
+            </div>
           `}
         </div>
       </div>

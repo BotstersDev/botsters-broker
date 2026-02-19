@@ -202,8 +202,27 @@ export function logAudit(db: Database.Database, accountId: string, agentId: stri
   ).run(id, accountId, agentId, action, resource, status, ipAddress ?? null, details ?? null, now);
 }
 
-export function listAudit(db: Database.Database, accountId: string, limit: number = 100): AuditEntry[] {
-  return db.prepare('SELECT * FROM audit_log WHERE account_id = ? ORDER BY created_at DESC LIMIT ?').all(accountId, limit) as AuditEntry[];
+export function listAudit(db: Database.Database, accountId: string, opts?: { limit?: number; action?: string; after?: string; before?: string }): (AuditEntry & { agent_name?: string })[] {
+  const limit = opts?.limit ?? 200;
+  const conditions = ['a.account_id = ?'];
+  const params: (string | number)[] = [accountId];
+
+  if (opts?.action) {
+    conditions.push('a.action LIKE ?');
+    params.push(`%${opts.action}%`);
+  }
+  if (opts?.after) {
+    conditions.push('a.created_at >= ?');
+    params.push(opts.after);
+  }
+  if (opts?.before) {
+    conditions.push('a.created_at <= ?');
+    params.push(opts.before);
+  }
+
+  params.push(limit);
+  const sql = `SELECT a.*, ag.name as agent_name FROM audit_log a LEFT JOIN agents ag ON a.agent_id = ag.id WHERE ${conditions.join(' AND ')} ORDER BY a.created_at DESC LIMIT ?`;
+  return db.prepare(sql).all(...params) as (AuditEntry & { agent_name?: string })[];
 }
 
 // ─── Sessions ──────────────────────────────────────────────────────────────────
