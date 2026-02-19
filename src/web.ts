@@ -996,6 +996,16 @@ webRoutes.get('/activity', (c) => {
   const limitParam = parseInt(c.req.query('limit') || '200', 10);
   const limit = Math.min(Math.max(limitParam, 10), 1000);
 
+  // Timezone: query param > cookie > default (America/Los_Angeles)
+  const TIMEZONES = [
+    'America/Los_Angeles', 'America/Denver', 'America/Chicago', 'America/New_York',
+    'UTC', 'Europe/London', 'Europe/Berlin', 'Europe/Paris',
+    'Asia/Tokyo', 'Asia/Shanghai', 'Asia/Kolkata', 'Australia/Sydney',
+  ];
+  const tzParam = c.req.query('tz') || '';
+  const tzCookie = (c.req.header('cookie') || '').match(/broker_tz=([^;]+)/)?.[1] || '';
+  const tz = TIMEZONES.includes(tzParam) ? tzParam : TIMEZONES.includes(tzCookie) ? tzCookie : 'America/Los_Angeles';
+
   const entries = db.listAudit(c.env.db, accountId, {
     limit,
     action: actionFilter || undefined,
@@ -1006,6 +1016,17 @@ webRoutes.get('/activity', (c) => {
   // Collect unique action types for the filter dropdown
   const actionTypes = [...new Set(entries.map(e => e.action))].sort();
 
+  // Format timestamp in selected timezone
+  const fmtTime = (utcIso: string) => {
+    try {
+      return new Intl.DateTimeFormat('en-US', {
+        timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+      }).format(new Date(utcIso));
+    } catch { return utcIso.replace('T', ' ').split('.')[0]; }
+  };
+  const tzShort = (() => { try { return new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'short' }).formatToParts(new Date()).find(p => p.type === 'timeZoneName')?.value || tz; } catch { return tz; } })();
+
   const rows = raw(entries.map(e => {
     const agentLabel = e.agent_name || e.agent_id || '-';
     const agentTitle = e.agent_id ? `ID: ${e.agent_id}` : '';
@@ -1014,7 +1035,7 @@ webRoutes.get('/activity', (c) => {
       : e.status === 'denied' ? 'badge-danger'
       : e.status === 'retry' ? 'badge-warning'
       : 'badge-muted';
-    const ts = e.created_at.replace('T', ' ').split('.')[0];
+    const ts = fmtTime(e.created_at);
     return html`
     <tr>
       <td class="text-muted" style="white-space:nowrap">${ts}</td>
@@ -1049,6 +1070,12 @@ webRoutes.get('/activity', (c) => {
               <input type="datetime-local" name="before" value="${beforeFilter ? beforeFilter.slice(0,16) : ''}" style="padding:0.4rem 0.6rem;border-radius:4px;border:1px solid #444;background:#1a1a2e;color:#e0e0e0" />
             </div>
             <div>
+              <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;color:#888">Timezone</label>
+              <select name="tz" style="padding:0.4rem 0.6rem;border-radius:4px;border:1px solid #444;background:#1a1a2e;color:#e0e0e0">
+                ${raw(TIMEZONES.map(t => html`<option value="${t}" ${t === tz ? 'selected' : ''}>${t}</option>`).join(''))}
+              </select>
+            </div>
+            <div>
               <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;color:#888">Limit</label>
               <input type="number" name="limit" value="${limit}" min="10" max="1000" step="50" style="width:5rem;padding:0.4rem 0.6rem;border-radius:4px;border:1px solid #444;background:#1a1a2e;color:#e0e0e0" />
             </div>
@@ -1059,7 +1086,7 @@ webRoutes.get('/activity', (c) => {
 
         <div class="card">
           <div style="display:flex;justify-content:space-between;align-items:center;padding:0.5rem 0;margin-bottom:0.5rem">
-            <span class="text-muted" style="font-size:0.85rem">Showing ${entries.length} entries (newest first)</span>
+            <span class="text-muted" style="font-size:0.85rem">Showing ${entries.length} entries (newest first) · ${tzShort}</span>
           </div>
           ${entries.length === 0 ? html`<div class="empty"><p>No activity matches your filters</p></div>` : html`
             <div style="overflow-x:auto">
@@ -1073,5 +1100,9 @@ webRoutes.get('/activity', (c) => {
       </div>
     </main>
   `;
+  // Persist timezone preference in cookie (1 year)
+  if (tzParam && TIMEZONES.includes(tzParam)) {
+    c.header('Set-Cookie', `broker_tz=${tzParam}; Path=/; Max-Age=31536000; SameSite=Lax`);
+  }
   return c.html(layout('Activity', content, navBar('activity')));
 });
