@@ -6,6 +6,7 @@ import { Hono } from 'hono';
 import type { Agent, Env } from './types.js';
 import * as db from './db.js';
 import { decrypt, encrypt, hashPassword, hmacSign, sha256Hex, hmacSha256 } from './crypto.js';
+import { handleWebSearch } from './web-search.js';
 
 export const apiRoutes = new Hono<{ Bindings: Env }>();
 
@@ -327,6 +328,16 @@ const SERVICE_CONFIG: Record<string, { baseUrl: string; secretName: string; auth
   cloudflare: { baseUrl: 'https://api.cloudflare.com', secretName: 'CLOUDFLARE_API_TOKEN', authHeader: 'Authorization', authFormat: 'Bearer' },
   brave: { baseUrl: 'https://api.search.brave.com', secretName: 'BRAVE_BASE_AI_TOKEN', authHeader: 'X-Subscription-Token' },
 };
+
+// ─── Tiered Web Search ─────────────────────────────────────────────────────────
+// Dedicated capability: tries FREE_BRAVE_AI_TOKEN first, falls back to
+// BRAVE_BASE_AI_TOKEN on 429. Brain never sees either key.
+
+apiRoutes.post('/v1/web/search', async (c) => {
+  const agent = authenticateAgent(c);
+  if (!agent) return c.json({ ok: false, error: 'Unauthorized' }, 401);
+  return handleWebSearch(c, agent);
+});
 
 apiRoutes.post('/proxy/request', async (c) => {
   const agent = authenticateAgent(c);
