@@ -8,7 +8,7 @@
 import { Hono } from 'hono';
 import type { Agent, Env } from './types.js';
 import * as db from './db.js';
-import { decrypt } from './crypto.js';
+import { decrypt, encrypt } from './crypto.js';
 
 export const inferenceRoutes = new Hono<{ Bindings: Env }>();
 
@@ -72,6 +72,99 @@ function buildAnthropicAuthHeaders(token: string): Record<string, string> {
     'x-api-key': token,
     'anthropic-version': '2023-06-01',
   };
+}
+
+type OpenAITokenType = 'api-key' | 'oauth-access' | 'oauth-bundle';
+
+type OpenAIOAuthBundle = {
+  access: string;
+  refresh?: string;
+  expires?: number;
+  accountId?: string;
+};
+
+function parseOpenAIOAuthBundle(raw: string): OpenAIOAuthBundle | null {
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const access = typeof parsed.access === 'string' ? parsed.access : undefined;
+    if (!access) return null;
+    return {
+      access,
+      refresh: typeof parsed.refresh === 'string' ? parsed.refresh : undefined,
+      expires: typeof parsed.expires === 'number' ? parsed.expires : undefined,
+      accountId: typeof parsed.accountId === 'string' ? parsed.accountId : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function detectOpenAITokenType(token: string): OpenAITokenType {
+  if (token.startsWith('sk-')) return 'api-key';
+  if (token.trim().startsWith('{')) {
+    const bundle = parseOpenAIOAuthBundle(token);
+    if (bundle) return 'oauth-bundle';
+  }
+  return 'oauth-access';
+}
+
+function resolveOpenAIAuth(token: string): { authHeaderValue: string; mode: OpenAITokenType; expires?: number; bundle?: OpenAIOAuthBundle } {
+  const mode = detectOpenAITokenType(token);
+  if (mode === 'oauth-bundle') {
+    const bundle = parseOpenAIOAuthBundle(token);
+    if (!bundle?.access) {
+      throw new Error('Invalid OpenAI OAuth bundle: missing access token');
+    }
+    return {
+      authHeaderValue: `Bearer ${bundle.access}`,
+      mode,
+      expires: bundle.expires,
+      bundle,
+    };
+  }
+  if (mode === 'api-key') {
+    return {
+      authHeaderValue: `Bearer ${token}`,
+      mode,
+    };
+  }
+  return {
+    authHeaderValue: `Bearer ${token}`,
+    mode,
+  };
+}
+
+const OPENAI_CODEX_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
+const OPENAI_CODEX_TOKEN_URL = 'https://auth.openai.com/oauth/token';
+
+async function refreshOpenAICodexBundle(bundle: OpenAIOAuthBundle): Promise<OpenAIOAuthBundle | null> {
+  if (!bundle.refresh) return null;
+  const body = new URLSearchParams({
+    grant_type: 'refresh_token',
+    refresh_token: bundle.refresh,
+    client_id: OPENAI_CODEX_CLIENT_ID,
+  });
+  const response = await fetch(OPENAI_CODEX_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  });
+  if (!response.ok) return null;
+  const json = await response.json() as { access_token?: string; refresh_token?: string; expires_in?: number };
+  if (!json.access_token || !json.refresh_token || typeof json.expires_in !== 'number') return null;
+  return {
+    access: json.access_token,
+    refresh: json.refresh_token,
+    expires: Date.now() + (json.expires_in * 1000),
+    accountId: bundle.accountId,
+  };
+}
+
+function persistOpenAICodexBundle(c: any, agent: Agent, bundle: OpenAIOAuthBundle): void {
+  const target = db.getSecret(c.env.db, agent.account_id, 'OPENAI_TOKEN', agent.id);
+  if (!target) return;
+  const encryptedValue = encrypt(JSON.stringify(bundle), c.env.masterKey);
+  db.updateSecret(c.env.db, target.id, agent.account_id, target.name, target.provider, encryptedValue);
 }
 
 // ─── Provider Configs ──────────────────────────────────────────────────────────
@@ -211,12 +304,32 @@ inferenceRoutes.post('/inference', async (c) => {
     }
   }
 
+  let authMode: string | undefined;
+  let oauthExpires: number | undefined;
+  if (req.provider === 'openai') {
+    try {
+      const openaiAuth = resolveOpenAIAuth(apiKey);
+      authMode = openaiAuth.mode;
+      oauthExpires = openaiAuth.expires;
+    } catch (e) {
+      const error = e instanceof Error ? e.message : 'Invalid OpenAI auth material';
+      db.logAudit(c.env.db, agent.account_id, agent.id, 'inference.request', capabilityName, 'denied', null, error);
+      return c.json({ error }, 400);
+    }
+  }
+
   // 5. Log the request (no content — privacy)
   db.logAudit(
     c.env.db, agent.account_id, agent.id,
     'inference.request', capabilityName, 'pending',
     c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || null,
-    JSON.stringify({ model: req.model, stream: req.stream !== false, messageCount: req.messages.length })
+    JSON.stringify({
+      model: req.model,
+      stream: req.stream !== false,
+      messageCount: req.messages.length,
+      authMode,
+      oauthExpires,
+    })
   );
 
   // 6. Build provider request
@@ -226,10 +339,30 @@ inferenceRoutes.post('/inference', async (c) => {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
   };
+  let openaiAuthForRetry: { authHeaderValue: string; mode: OpenAITokenType; expires?: number; bundle?: OpenAIOAuthBundle } | undefined;
 
-  // Dynamic auth headers — Anthropic needs token-type detection (API key vs OAuth)
+  // Dynamic auth headers — provider-specific token handling
   if (req.provider === 'anthropic') {
     Object.assign(headers, buildAnthropicAuthHeaders(apiKey));
+  } else if (req.provider === 'openai') {
+    let openaiAuth = resolveOpenAIAuth(apiKey);
+    if (openaiAuth.expires && Date.now() > openaiAuth.expires && openaiAuth.bundle?.refresh) {
+      const refreshed = await refreshOpenAICodexBundle(openaiAuth.bundle);
+      if (refreshed) {
+        persistOpenAICodexBundle(c, agent, refreshed);
+        openaiAuth = {
+          authHeaderValue: `Bearer ${refreshed.access}`,
+          mode: 'oauth-bundle',
+          expires: refreshed.expires,
+          bundle: refreshed,
+        };
+      }
+    }
+    if (openaiAuth.expires && Date.now() > openaiAuth.expires) {
+      return c.json({ error: 'OpenAI OAuth token appears expired in broker secret; re-auth required.' }, 401);
+    }
+    openaiAuthForRetry = openaiAuth;
+    headers['Authorization'] = openaiAuth.authHeaderValue;
   } else {
     // Generic provider auth
     if (providerConfig.extraHeaders) Object.assign(headers, providerConfig.extraHeaders);
@@ -242,11 +375,24 @@ inferenceRoutes.post('/inference', async (c) => {
 
   // 7. Proxy the request
   try {
-    const response = await fetch(url, {
+    let response = await fetch(url, {
       method: 'POST',
       headers,
       body: JSON.stringify(providerBody),
     });
+
+    if (req.provider === 'openai' && response.status === 401 && openaiAuthForRetry?.bundle?.refresh) {
+      const refreshed = await refreshOpenAICodexBundle(openaiAuthForRetry.bundle);
+      if (refreshed) {
+        persistOpenAICodexBundle(c, agent, refreshed);
+        headers['Authorization'] = `Bearer ${refreshed.access}`;
+        response = await fetch(url, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(providerBody),
+        });
+      }
+    }
 
     const latencyMs = Date.now() - startTime;
 
@@ -528,6 +674,34 @@ inferenceRoutes.post('/proxy/openai/*', async (c) => {
     return c.json({ error: result.error }, result.status as any);
   }
 
+  let openaiAuth: { authHeaderValue: string; mode: OpenAITokenType; expires?: number; bundle?: OpenAIOAuthBundle };
+  try {
+    openaiAuth = resolveOpenAIAuth(result.apiKey);
+  } catch (e) {
+    const error = e instanceof Error ? e.message : 'Invalid OpenAI auth material';
+    db.logAudit(c.env.db, agent.account_id, agent.id, 'proxy.request', 'inference/openai', 'denied', null, error);
+    return c.json({ error }, 400);
+  }
+
+  if (openaiAuth.expires && Date.now() > openaiAuth.expires && openaiAuth.bundle?.refresh) {
+    const refreshed = await refreshOpenAICodexBundle(openaiAuth.bundle);
+    if (refreshed) {
+      persistOpenAICodexBundle(c, agent, refreshed);
+      openaiAuth = {
+        authHeaderValue: `Bearer ${refreshed.access}`,
+        mode: 'oauth-bundle',
+        expires: refreshed.expires,
+        bundle: refreshed,
+      };
+    }
+  }
+
+  if (openaiAuth.expires && Date.now() > openaiAuth.expires) {
+    const error = 'OpenAI OAuth token appears expired in broker secret; re-auth required.';
+    db.logAudit(c.env.db, agent.account_id, agent.id, 'proxy.request', 'inference/openai', 'denied', null, error);
+    return c.json({ error }, 401);
+  }
+
   const fullPath = c.req.path;
   const providerPath = fullPath.replace(/^\/v1\/proxy\/openai/, '');
   const url = `https://api.openai.com${providerPath}`;
@@ -539,17 +713,32 @@ inferenceRoutes.post('/proxy/openai/*', async (c) => {
   try { model = JSON.parse(requestBody).model || 'unknown'; } catch {}
 
   db.logAudit(c.env.db, agent.account_id, agent.id, 'proxy.request', 'inference/openai', 'pending', null,
-    JSON.stringify({ model, path: providerPath }));
+    JSON.stringify({ model, path: providerPath, authMode: openaiAuth.mode, oauthExpires: openaiAuth.expires }));
 
   try {
-    const response = await fetch(url, {
+    let response = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': contentType,
-        'Authorization': `Bearer ${result.apiKey}`,
+        'Authorization': openaiAuth.authHeaderValue,
       },
       body: requestBody,
     });
+
+    if (response.status === 401 && openaiAuth.bundle?.refresh) {
+      const refreshed = await refreshOpenAICodexBundle(openaiAuth.bundle);
+      if (refreshed) {
+        persistOpenAICodexBundle(c, agent, refreshed);
+        response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': contentType,
+            'Authorization': `Bearer ${refreshed.access}`,
+          },
+          body: requestBody,
+        });
+      }
+    }
 
     const latencyMs = Date.now() - startTime;
 
