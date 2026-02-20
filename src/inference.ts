@@ -460,7 +460,8 @@ inferenceRoutes.post('/inference', async (c) => {
 
     // 8. Stream the response back
     const forceStream = req.provider === 'openai' && openaiAuthForRetry?.mode === 'oauth-bundle';
-    if ((req.stream !== false || forceStream) && response.headers.get('Content-Type')?.includes('text/event-stream')) {
+    const upstreamIsSse = response.headers.get('Content-Type')?.includes('text/event-stream') ?? false;
+    if ((req.stream !== false || forceStream) && (upstreamIsSse || forceStream)) {
       // SSE streaming — passthrough the stream, log completion after
       db.logAudit(
         c.env.db, agent.account_id, agent.id,
