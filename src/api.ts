@@ -334,7 +334,7 @@ const SERVICE_CONFIG: Record<string, { baseUrl: string; secretName: string; auth
 // Dedicated capability: tries FREE_BRAVE_AI_TOKEN first, falls back to
 // BRAVE_BASE_AI_TOKEN on 429. Brain never sees either key.
 
-apiRoutes.post('/v1/web/search', async (c) => {
+apiRoutes.post('/web/search', async (c) => {
   const agent = authenticateAgent(c);
   if (!agent) return c.json({ ok: false, error: 'Unauthorized' }, 401);
   return handleWebSearch(c, agent);
