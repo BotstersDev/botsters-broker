@@ -167,6 +167,43 @@ function persistOpenAICodexBundle(c: any, agent: Agent, bundle: OpenAIOAuthBundl
   db.updateSecret(c.env.db, target.id, agent.account_id, target.name, target.provider, encryptedValue);
 }
 
+function extractTextContent(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    const texts = content
+      .map((part) => {
+        if (typeof part === 'string') return part;
+        if (part && typeof part === 'object' && 'text' in part && typeof (part as { text?: unknown }).text === 'string') {
+          return (part as { text: string }).text;
+        }
+        return '';
+      })
+      .filter(Boolean);
+    return texts.join('\n');
+  }
+  return '';
+}
+
+function buildOpenAICodexBody(req: InferenceRequest): Record<string, unknown> {
+  const messages = req.messages as Array<{ role?: string; content?: unknown }>;
+  const systemFromMessages = messages.find((m) => m.role === 'system');
+  const instructions = (typeof req.system === 'string' ? req.system : extractTextContent(req.system)) || extractTextContent(systemFromMessages?.content) || 'You are a helpful assistant.';
+  const input = messages
+    .filter((m) => m.role !== 'system')
+    .map((m) => ({
+      role: m.role ?? 'user',
+      content: [{ type: 'input_text', text: extractTextContent(m.content) }],
+    }));
+
+  return {
+    model: req.model,
+    instructions,
+    input,
+    stream: true,
+    store: false,
+  };
+}
+
 // ─── Provider Configs ──────────────────────────────────────────────────────────
 
 const PROVIDERS: Record<string, ProviderConfig> = {
@@ -333,8 +370,8 @@ inferenceRoutes.post('/inference', async (c) => {
   );
 
   // 6. Build provider request
-  const providerBody = providerConfig.buildBody(req);
-  const url = `${providerConfig.baseUrl}${providerConfig.messagesPath}`;
+  let providerBody: Record<string, unknown> = providerConfig.buildBody(req);
+  let url = `${providerConfig.baseUrl}${providerConfig.messagesPath}`;
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -363,6 +400,17 @@ inferenceRoutes.post('/inference', async (c) => {
     }
     openaiAuthForRetry = openaiAuth;
     headers['Authorization'] = openaiAuth.authHeaderValue;
+
+    // Codex OAuth parity path (mirrors OpenClaw codex backend behavior)
+    if (openaiAuth.mode === 'oauth-bundle') {
+      url = 'https://chatgpt.com/backend-api/codex/responses';
+      providerBody = buildOpenAICodexBody(req);
+      headers['User-Agent'] = 'CodexBar';
+      headers['Accept'] = 'text/event-stream';
+      if (openaiAuth.bundle?.accountId) {
+        headers['ChatGPT-Account-Id'] = openaiAuth.bundle.accountId;
+      }
+    }
   } else {
     // Generic provider auth
     if (providerConfig.extraHeaders) Object.assign(headers, providerConfig.extraHeaders);
@@ -411,7 +459,8 @@ inferenceRoutes.post('/inference', async (c) => {
     }
 
     // 8. Stream the response back
-    if (req.stream !== false && response.headers.get('Content-Type')?.includes('text/event-stream')) {
+    const forceStream = req.provider === 'openai' && openaiAuthForRetry?.mode === 'oauth-bundle';
+    if ((req.stream !== false || forceStream) && response.headers.get('Content-Type')?.includes('text/event-stream')) {
       // SSE streaming — passthrough the stream, log completion after
       db.logAudit(
         c.env.db, agent.account_id, agent.id,
