@@ -754,38 +754,64 @@ inferenceRoutes.post('/proxy/openai/*', async (c) => {
 
   const fullPath = c.req.path;
   const providerPath = fullPath.replace(/^\/v1\/proxy\/openai/, '');
-  const url = `https://api.openai.com${providerPath}`;
 
   const requestBody = await c.req.raw.clone().text();
   const contentType = c.req.header('content-type') || 'application/json';
 
   let model = 'unknown';
-  try { model = JSON.parse(requestBody).model || 'unknown'; } catch {}
+  let parsedBody: Record<string, unknown> | null = null;
+  try { parsedBody = JSON.parse(requestBody); model = (parsedBody as any)?.model || 'unknown'; } catch {}
+
+  // Codex OAuth parity: rewrite to chatgpt.com/backend-api/codex/responses
+  const isCodexOAuth = openaiAuth.mode === 'oauth-bundle';
+  let url: string;
+  let finalBody: string;
+  const headers: Record<string, string> = {
+    'Authorization': openaiAuth.authHeaderValue,
+  };
+
+  if (isCodexOAuth && parsedBody) {
+    url = 'https://chatgpt.com/backend-api/codex/responses';
+    // Build Codex-compatible body from the OpenAI Responses API shape
+    const codexBody: Record<string, unknown> = {
+      model: model,
+      instructions: (parsedBody as any).instructions ?? 'You are a helpful assistant.',
+      input: (parsedBody as any).input ?? [],
+      stream: true,
+      store: false,
+    };
+    finalBody = JSON.stringify(codexBody);
+    headers['Content-Type'] = 'application/json';
+    headers['User-Agent'] = 'CodexBar';
+    headers['Accept'] = 'text/event-stream';
+    if (openaiAuth.bundle?.accountId) {
+      headers['ChatGPT-Account-Id'] = openaiAuth.bundle.accountId;
+    }
+  } else {
+    url = `https://api.openai.com${providerPath}`;
+    finalBody = requestBody;
+    headers['Content-Type'] = contentType;
+  }
 
   db.logAudit(c.env.db, agent.account_id, agent.id, 'proxy.request', 'inference/openai', 'pending', null,
-    JSON.stringify({ model, path: providerPath, authMode: openaiAuth.mode, oauthExpires: openaiAuth.expires }));
+    JSON.stringify({ model, path: isCodexOAuth ? '/codex/responses' : providerPath, authMode: openaiAuth.mode, oauthExpires: openaiAuth.expires }));
 
   try {
     let response = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': contentType,
-        'Authorization': openaiAuth.authHeaderValue,
-      },
-      body: requestBody,
+      headers,
+      body: finalBody,
     });
 
     if (response.status === 401 && openaiAuth.bundle?.refresh) {
       const refreshed = await refreshOpenAICodexBundle(openaiAuth.bundle);
       if (refreshed) {
         persistOpenAICodexBundle(c, agent, refreshed);
+        headers['Authorization'] = `Bearer ${refreshed.access}`;
         response = await fetch(url, {
           method: 'POST',
-          headers: {
-            'Content-Type': contentType,
-            'Authorization': `Bearer ${refreshed.access}`,
-          },
-          body: requestBody,
+          headers,
+          body: finalBody,
         });
       }
     }
@@ -802,7 +828,8 @@ inferenceRoutes.post('/proxy/openai/*', async (c) => {
       });
     }
 
-    if (response.headers.get('Content-Type')?.includes('text/event-stream')) {
+    const upstreamCt = response.headers.get('Content-Type') || '';
+    if (upstreamCt.includes('text/event-stream') || isCodexOAuth) {
       db.logAudit(c.env.db, agent.account_id, agent.id, 'proxy.streaming', 'inference/openai', 'success', null,
         JSON.stringify({ model, latencyMs }));
       return new Response(response.body, {
