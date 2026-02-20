@@ -266,13 +266,18 @@ const PROVIDERS: Record<string, ProviderConfig> = {
 // ─── Auth Helper ───────────────────────────────────────────────────────────────
 
 function authenticateAgent(c: any): Agent | null {
-  // Support both Authorization: Bearer <token> and x-api-key: <token>
-  // The latter is needed because Anthropic SDK sends broker tokens via x-api-key
-  // when the broker is configured as a baseUrl replacement
+  // Support multiple auth headers for different provider conventions:
+  //   1. X-Agent-Token: <token>  — explicit agent auth (preferred for OpenAI proxy
+  //      where Authorization carries the provider credential)
+  //   2. Authorization: Bearer <token>  — standard
+  //   3. x-api-key: <token>  — Anthropic SDK convention
+  const xAgentToken = c.req.header('X-Agent-Token');
   const authHeader = c.req.header('Authorization');
   const xApiKey = c.req.header('x-api-key');
   let token: string | undefined;
-  if (authHeader?.startsWith('Bearer ')) {
+  if (xAgentToken) {
+    token = xAgentToken;
+  } else if (authHeader?.startsWith('Bearer ')) {
     token = authHeader.slice(7);
   } else if (xApiKey) {
     token = xApiKey;
