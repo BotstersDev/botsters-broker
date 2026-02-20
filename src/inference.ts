@@ -266,17 +266,21 @@ const PROVIDERS: Record<string, ProviderConfig> = {
 // ─── Auth Helper ───────────────────────────────────────────────────────────────
 
 function authenticateAgent(c: any): Agent | null {
-  // Support multiple auth headers for different provider conventions:
-  //   1. X-Agent-Token: <token>  — explicit agent auth (preferred for OpenAI proxy
+  // Support multiple auth methods for different provider conventions:
+  //   1. X-Agent-Token header — explicit agent auth (preferred for OpenAI proxy
   //      where Authorization carries the provider credential)
-  //   2. Authorization: Bearer <token>  — standard
-  //   3. x-api-key: <token>  — Anthropic SDK convention
+  //   2. ?agent_token= query param — for OpenAI proxy when headers aren't controllable
+  //   3. Authorization: Bearer <token>  — standard (works when token is seks_agent_*)
+  //   4. x-api-key: <token>  — Anthropic SDK convention
   const xAgentToken = c.req.header('X-Agent-Token');
+  const queryToken = new URL(c.req.url).searchParams.get('agent_token');
   const authHeader = c.req.header('Authorization');
   const xApiKey = c.req.header('x-api-key');
   let token: string | undefined;
   if (xAgentToken) {
     token = xAgentToken;
+  } else if (queryToken) {
+    token = queryToken;
   } else if (authHeader?.startsWith('Bearer ')) {
     token = authHeader.slice(7);
   } else if (xApiKey) {
