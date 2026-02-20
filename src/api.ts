@@ -7,6 +7,7 @@ import type { Agent, Env } from './types.js';
 import * as db from './db.js';
 import { decrypt, encrypt, hashPassword, hmacSign, sha256Hex, hmacSha256 } from './crypto.js';
 import { handleWebSearch } from './web-search.js';
+import crypto from 'node:crypto';
 
 export const apiRoutes = new Hono<{ Bindings: Env }>();
 
@@ -732,4 +733,46 @@ apiRoutes.get('/commands', (c) => {
   if (!agent) return c.json({ ok: false, error: 'Unauthorized' }, 401);
   const commands = db.listRecentCommands(c.env.db, agent.id, 50);
   return c.json({ ok: true, commands });
+});
+
+// Add after the GET /commands endpoint (around line 734)
+apiRoutes.post('/v1/command', async (c) => {
+  const agent = authenticateAgent(c);
+  if (!agent) return c.json({ ok: false, error: 'Unauthorized' }, 401);
+
+  const body = await c.req.json<{
+    actuator_id?: string;
+    capability: string;
+    payload: unknown;
+    timeout_ms?: number;
+  }>();
+
+  if (!body.capability) return c.json({ ok: false, error: 'Missing capability' }, 400);
+
+  const id = crypto.randomUUID();
+  const msg = {
+    type: 'command_request' as const,
+    id,
+    actuator_id: body.actuator_id,
+    capability: body.capability,
+    payload: body.payload ?? {},
+  };
+
+  // Get the command router from the app context
+  const router = c.env.commandRouter;
+  const { commandId, error } = router.handleCommandRequest(agent.id, agent.account_id, msg);
+
+  if (!commandId) {
+    return c.json({ ok: false, error: error || 'No actuator available' }, 404);
+  }
+
+  // Wait for result synchronously
+  const timeoutMs = Math.min(body.timeout_ms ?? 30000, 300000); // max 5 min
+  const result = await router.waitForResult(commandId, timeoutMs);
+
+  if (!result) {
+    return c.json({ ok: false, error: 'Command timed out', command_id: commandId }, 504);
+  }
+
+  return c.json({ ok: true, command_id: commandId, status: result.status, result: result.result });
 });

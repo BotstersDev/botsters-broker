@@ -47,9 +47,14 @@ if (fs.existsSync(schemaPath)) {
 // Build Hono app with env bindings
 const app = new Hono<{ Bindings: Env }>();
 
+// Create WebSocket hub and router first
+const hub = new WsHub(database, config);
+const router = new CommandRouter(database, hub, config.masterKey);
+hub.setRouter(router);
+
 // Inject env bindings into every request
 app.use('*', async (c, next) => {
-  c.env = { db: database, masterKey: config.masterKey };
+  c.env = { db: database, masterKey: config.masterKey, commandRouter: router };
   await next();
 });
 
@@ -200,10 +205,7 @@ app.post('/v1/command', async (c) => {
   return c.json({ status: 'sent', command_id: commandId, message: 'Command routed. Results delivered via WS to brain.' });
 });
 
-// Create WebSocket hub
-const hub = new WsHub(database, config);
-const router = new CommandRouter(database, hub, config.masterKey);
-hub.setRouter(router);
+// Start the hub (router already created above)
 hub.start();
 
 // Start HTTP server with WebSocket upgrade handling

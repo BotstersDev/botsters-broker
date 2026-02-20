@@ -3,6 +3,7 @@
  */
 
 import type Database from 'better-sqlite3';
+import type { CommandRouter } from './command-router.js';
 
 export interface AppEnv {
   db: Database.Database;
@@ -165,4 +166,5 @@ export interface ProxyResponse {
 export interface Env {
   db: Database.Database;
   masterKey: string;
+  commandRouter: CommandRouter;
 }
