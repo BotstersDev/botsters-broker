@@ -133,6 +133,7 @@ CREATE INDEX IF NOT EXISTS idx_agents_token_hash ON agents(token_hash);
 CREATE INDEX IF NOT EXISTS idx_secrets_account ON secrets(account_id);
 CREATE INDEX IF NOT EXISTS idx_audit_account ON audit_log(account_id);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_account_created ON audit_log(account_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account_id);
 CREATE INDEX IF NOT EXISTS idx_fake_tokens_token ON fake_tokens(token);
 CREATE INDEX IF NOT EXISTS idx_fake_tokens_agent ON fake_tokens(agent_id);

@@ -989,32 +989,132 @@ webRoutes.get('/activity', (c) => {
   const accountId = getSessionAccount(c);
   if (!accountId) return redirect('/login');
 
-  const entries = db.listAudit(c.env.db, accountId, 100);
+  // Parse query params for filtering
+  const actionFilter = c.req.query('action') || '';
+  const agentFilter = c.req.query('agent') || '';
+  const afterFilter = c.req.query('after') || '';
+  const beforeFilter = c.req.query('before') || '';
+  const limitParam = parseInt(c.req.query('limit') || '200', 10);
+  const limit = Math.max(limitParam, 1);
 
-  const rows = raw(entries.map(e => html`
+  // Get all agents for the filter dropdown
+  const agents = db.listAgents(c.env.db, accountId);
+
+  // Timezone: query param > cookie > default (America/Los_Angeles)
+  const TIMEZONES = [
+    'America/Los_Angeles', 'America/Denver', 'America/Chicago', 'America/New_York',
+    'UTC', 'Europe/London', 'Europe/Berlin', 'Europe/Paris',
+    'Asia/Tokyo', 'Asia/Shanghai', 'Asia/Kolkata', 'Australia/Sydney',
+  ];
+  const tzParam = c.req.query('tz') || '';
+  const tzCookie = (c.req.header('cookie') || '').match(/broker_tz=([^;]+)/)?.[1] || '';
+  const tz = TIMEZONES.includes(tzParam) ? tzParam : TIMEZONES.includes(tzCookie) ? tzCookie : 'America/Los_Angeles';
+
+  const entries = db.listAudit(c.env.db, accountId, {
+    limit,
+    action: actionFilter || undefined,
+    agentId: agentFilter || undefined,
+    after: afterFilter || undefined,
+    before: beforeFilter || undefined,
+  });
+
+  // Collect unique action types for the filter dropdown
+  const actionTypes = [...new Set(entries.map(e => e.action))].sort();
+
+  // Format timestamp in selected timezone
+  const fmtTime = (utcIso: string) => {
+    try {
+      return new Intl.DateTimeFormat('en-US', {
+        timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+      }).format(new Date(utcIso));
+    } catch { return utcIso.replace('T', ' ').split('.')[0]; }
+  };
+  const tzShort = (() => { try { return new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'short' }).formatToParts(new Date()).find(p => p.type === 'timeZoneName')?.value || tz; } catch { return tz; } })();
+
+  const rows = raw(entries.map(e => {
+    const agentLabel = e.agent_name || e.agent_id || '-';
+    const agentTitle = e.agent_id ? `ID: ${e.agent_id}` : '';
+    const statusClass = e.status === 'success' ? 'badge-success'
+      : e.status === 'error' ? 'badge-danger'
+      : e.status === 'denied' ? 'badge-danger'
+      : e.status === 'retry' ? 'badge-warning'
+      : 'badge-muted';
+    const ts = fmtTime(e.created_at);
+    return html`
     <tr>
-      <td class="text-muted">${e.created_at.replace('T', ' ').split('.')[0]}</td>
-      <td>${e.agent_id || '-'}</td>
-      <td>${e.action}</td>
+      <td class="text-muted" style="white-space:nowrap">${ts}</td>
+      <td title="${agentTitle}"><strong>${agentLabel}</strong></td>
+      <td><code>${e.action}</code></td>
       <td>${e.resource ? html`<code class="token">${e.resource}</code>` : '-'}</td>
-      <td><span class="badge ${e.status === 'success' ? 'badge-success' : 'badge-muted'}">${e.status}</span></td>
-    </tr>
-  `).join(''));
+      <td><span class="badge ${statusClass}">${e.status}</span></td>
+      <td class="text-muted" style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${e.details || ''}">${e.details || '-'}</td>
+    </tr>`;
+  }).join(''));
 
   const content = html`
     <main>
       <div class="container">
         <h1>Activity Log</h1>
+
+        <div class="card" style="margin-bottom:1rem;padding:1rem">
+          <form method="GET" action="/activity" style="display:flex;gap:0.75rem;align-items:flex-end;flex-wrap:wrap">
+            <div>
+              <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;color:#888">Action Type</label>
+              <select name="action" style="padding:0.4rem 0.6rem;border-radius:4px;border:1px solid #444;background:#1a1a2e;color:#e0e0e0">
+                <option value="">All</option>
+                ${raw(actionTypes.map(a => html`<option value="${a}" ${a === actionFilter ? 'selected' : ''}>${a}</option>`).join(''))}
+              </select>
+            </div>
+            <div>
+              <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;color:#888">Agent</label>
+              <select name="agent" style="padding:0.4rem 0.6rem;border-radius:4px;border:1px solid #444;background:#1a1a2e;color:#e0e0e0">
+                <option value="">All</option>
+                ${raw(agents.map(a => html`<option value="${a.id}" ${a.id === agentFilter ? 'selected' : ''}>${a.name || a.id}</option>`).join(''))}
+              </select>
+            </div>
+            <div>
+              <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;color:#888">After</label>
+              <input type="datetime-local" name="after" value="${afterFilter ? afterFilter.slice(0,16) : ''}" style="padding:0.4rem 0.6rem;border-radius:4px;border:1px solid #444;background:#1a1a2e;color:#e0e0e0" />
+            </div>
+            <div>
+              <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;color:#888">Before</label>
+              <input type="datetime-local" name="before" value="${beforeFilter ? beforeFilter.slice(0,16) : ''}" style="padding:0.4rem 0.6rem;border-radius:4px;border:1px solid #444;background:#1a1a2e;color:#e0e0e0" />
+            </div>
+            <div>
+              <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;color:#888">Timezone</label>
+              <select name="tz" style="padding:0.4rem 0.6rem;border-radius:4px;border:1px solid #444;background:#1a1a2e;color:#e0e0e0">
+                ${raw(TIMEZONES.map(t => html`<option value="${t}" ${t === tz ? 'selected' : ''}>${t}</option>`).join(''))}
+              </select>
+            </div>
+            <div>
+              <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;color:#888">Limit</label>
+              <input type="number" name="limit" value="${limit}" min="1" max="10000" step="1" style="width:5rem;padding:0.4rem 0.6rem;border-radius:4px;border:1px solid #444;background:#1a1a2e;color:#e0e0e0" />
+            </div>
+            <button type="submit" style="padding:0.4rem 1rem;border-radius:4px;border:none;background:#4a6cf7;color:white;cursor:pointer">Filter</button>
+            <a href="/activity" style="padding:0.4rem 0.8rem;color:#888;text-decoration:none;font-size:0.85rem">Reset</a>
+          </form>
+        </div>
+
         <div class="card">
-          ${entries.length === 0 ? html`<div class="empty"><p>No activity recorded yet</p></div>` : html`
-            <table>
-              <thead><tr><th>Time</th><th>Agent</th><th>Action</th><th>Resource</th><th>Status</th></tr></thead>
-              <tbody>${rows}</tbody>
-            </table>
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:0.5rem 0;margin-bottom:0.5rem">
+            <span class="text-muted" style="font-size:0.85rem">Showing ${entries.length} entries (newest first) · ${tzShort}</span>
+          </div>
+          ${entries.length === 0 ? html`<div class="empty"><p>No activity matches your filters</p></div>` : html`
+            <div style="overflow-x:auto">
+              <table>
+                <thead><tr><th>Time</th><th>Agent</th><th>Action</th><th>Resource</th><th>Status</th><th>Details</th></tr></thead>
+                <tbody>${rows}</tbody>
+              </table>
+            </div>
           `}
         </div>
       </div>
     </main>
   `;
+  // Persist timezone preference in cookie (1 year)
+  if (tzParam && TIMEZONES.includes(tzParam)) {
+    c.header('Set-Cookie', `broker_tz=${tzParam}; Path=/; Max-Age=31536000; SameSite=Lax`);
+  }
   return c.html(layout('Activity', content, navBar('activity')));
 });
