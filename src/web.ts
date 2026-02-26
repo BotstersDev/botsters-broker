@@ -1027,7 +1027,7 @@ webRoutes.get('/actuators', (c) => {
             <form method="POST" action="/actuators/${a.id}/toggle-assignment" style="display:inline-block;margin-right:0.25rem;">
               <input type="hidden" name="agent_id" value="${asg.agent_id}">
               <button type="submit" class="btn btn-ghost btn-sm" style="padding:0.25rem 0.5rem;">
-                ${asg.agent_name}: ${asg.enabled ? 'enabled' : 'disabled'}
+                ${(asg as any).agent_name}: ${asg.enabled ? 'enabled' : 'disabled'}
               </button>
             </form>
           `).join('')) : html`<span class="text-muted">none</span>`}
