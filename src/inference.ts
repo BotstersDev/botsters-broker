@@ -8,7 +8,7 @@
 import { Hono } from 'hono';
 import type { Agent, Env } from './types.js';
 import * as db from './db.js';
-import { decrypt } from './crypto.js';
+import { decrypt, encrypt } from './crypto.js';
 
 export const inferenceRoutes = new Hono<{ Bindings: Env }>();
 
@@ -74,6 +74,136 @@ function buildAnthropicAuthHeaders(token: string): Record<string, string> {
   };
 }
 
+type OpenAITokenType = 'api-key' | 'oauth-access' | 'oauth-bundle';
+
+type OpenAIOAuthBundle = {
+  access: string;
+  refresh?: string;
+  expires?: number;
+  accountId?: string;
+};
+
+function parseOpenAIOAuthBundle(raw: string): OpenAIOAuthBundle | null {
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const access = typeof parsed.access === 'string' ? parsed.access : undefined;
+    if (!access) return null;
+    return {
+      access,
+      refresh: typeof parsed.refresh === 'string' ? parsed.refresh : undefined,
+      expires: typeof parsed.expires === 'number' ? parsed.expires : undefined,
+      accountId: typeof parsed.accountId === 'string' ? parsed.accountId : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function detectOpenAITokenType(token: string): OpenAITokenType {
+  if (token.startsWith('sk-')) return 'api-key';
+  if (token.trim().startsWith('{')) {
+    const bundle = parseOpenAIOAuthBundle(token);
+    if (bundle) return 'oauth-bundle';
+  }
+  return 'oauth-access';
+}
+
+function resolveOpenAIAuth(token: string): { authHeaderValue: string; mode: OpenAITokenType; expires?: number; bundle?: OpenAIOAuthBundle } {
+  const mode = detectOpenAITokenType(token);
+  if (mode === 'oauth-bundle') {
+    const bundle = parseOpenAIOAuthBundle(token);
+    if (!bundle?.access) {
+      throw new Error('Invalid OpenAI OAuth bundle: missing access token');
+    }
+    return {
+      authHeaderValue: `Bearer ${bundle.access}`,
+      mode,
+      expires: bundle.expires,
+      bundle,
+    };
+  }
+  if (mode === 'api-key') {
+    return {
+      authHeaderValue: `Bearer ${token}`,
+      mode,
+    };
+  }
+  return {
+    authHeaderValue: `Bearer ${token}`,
+    mode,
+  };
+}
+
+const OPENAI_CODEX_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
+const OPENAI_CODEX_TOKEN_URL = 'https://auth.openai.com/oauth/token';
+
+async function refreshOpenAICodexBundle(bundle: OpenAIOAuthBundle): Promise<OpenAIOAuthBundle | null> {
+  if (!bundle.refresh) return null;
+  const body = new URLSearchParams({
+    grant_type: 'refresh_token',
+    refresh_token: bundle.refresh,
+    client_id: OPENAI_CODEX_CLIENT_ID,
+  });
+  const response = await fetch(OPENAI_CODEX_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  });
+  if (!response.ok) return null;
+  const json = await response.json() as { access_token?: string; refresh_token?: string; expires_in?: number };
+  if (!json.access_token || !json.refresh_token || typeof json.expires_in !== 'number') return null;
+  return {
+    access: json.access_token,
+    refresh: json.refresh_token,
+    expires: Date.now() + (json.expires_in * 1000),
+    accountId: bundle.accountId,
+  };
+}
+
+function persistOpenAICodexBundle(c: any, agent: Agent, bundle: OpenAIOAuthBundle): void {
+  const target = db.getSecret(c.env.db, agent.account_id, 'OPENAI_TOKEN', agent.id);
+  if (!target) return;
+  const encryptedValue = encrypt(JSON.stringify(bundle), c.env.masterKey);
+  db.updateSecret(c.env.db, target.id, agent.account_id, target.name, target.provider, encryptedValue);
+}
+
+function extractTextContent(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    const texts = content
+      .map((part) => {
+        if (typeof part === 'string') return part;
+        if (part && typeof part === 'object' && 'text' in part && typeof (part as { text?: unknown }).text === 'string') {
+          return (part as { text: string }).text;
+        }
+        return '';
+      })
+      .filter(Boolean);
+    return texts.join('\n');
+  }
+  return '';
+}
+
+function buildOpenAICodexBody(req: InferenceRequest): Record<string, unknown> {
+  const messages = req.messages as Array<{ role?: string; content?: unknown }>;
+  const systemFromMessages = messages.find((m) => m.role === 'system');
+  const instructions = (typeof req.system === 'string' ? req.system : extractTextContent(req.system)) || extractTextContent(systemFromMessages?.content) || 'You are a helpful assistant.';
+  const input = messages
+    .filter((m) => m.role !== 'system')
+    .map((m) => ({
+      role: m.role ?? 'user',
+      content: [{ type: 'input_text', text: extractTextContent(m.content) }],
+    }));
+
+  return {
+    model: req.model,
+    instructions,
+    input,
+    stream: true,
+    store: false,
+  };
+}
+
 // ─── Provider Configs ──────────────────────────────────────────────────────────
 
 const PROVIDERS: Record<string, ProviderConfig> = {
@@ -131,18 +261,50 @@ const PROVIDERS: Record<string, ProviderConfig> = {
       return body;
     },
   },
+
+  xai: {
+    baseUrl: 'https://api.x.ai',
+    messagesPath: '/v1/chat/completions',
+    secretName: 'XAI_TOKEN',
+    authHeader: 'Authorization',
+    authFormat: 'Bearer',
+    buildBody: (req) => {
+      const body: Record<string, unknown> = {
+        model: req.model,
+        messages: req.messages,
+        stream: req.stream !== false,
+      };
+      if (req.max_tokens !== undefined) body.max_tokens = req.max_tokens;
+      if (req.temperature !== undefined) body.temperature = req.temperature;
+      if (req.top_p !== undefined) body.top_p = req.top_p;
+      // Pass through any additional fields
+      for (const key of ['stop', 'frequency_penalty', 'presence_penalty', 'tools', 'tool_choice', 'response_format']) {
+        if (req[key] !== undefined) body[key] = req[key];
+      }
+      return body;
+    },
+  },
 };
 
 // ─── Auth Helper ───────────────────────────────────────────────────────────────
 
 function authenticateAgent(c: any): Agent | null {
-  // Support both Authorization: Bearer <token> and x-api-key: <token>
-  // The latter is needed because Anthropic SDK sends broker tokens via x-api-key
-  // when the broker is configured as a baseUrl replacement
+  // Support multiple auth methods for different provider conventions:
+  //   1. X-Agent-Token header — explicit agent auth (preferred for OpenAI proxy
+  //      where Authorization carries the provider credential)
+  //   2. ?agent_token= query param — for OpenAI proxy when headers aren't controllable
+  //   3. Authorization: Bearer <token>  — standard (works when token is seks_agent_*)
+  //   4. x-api-key: <token>  — Anthropic SDK convention
+  const xAgentToken = c.req.header('X-Agent-Token');
+  const queryToken = new URL(c.req.url).searchParams.get('agent_token');
   const authHeader = c.req.header('Authorization');
   const xApiKey = c.req.header('x-api-key');
   let token: string | undefined;
-  if (authHeader?.startsWith('Bearer ')) {
+  if (xAgentToken) {
+    token = xAgentToken;
+  } else if (queryToken) {
+    token = queryToken;
+  } else if (authHeader?.startsWith('Bearer ')) {
     token = authHeader.slice(7);
   } else if (xApiKey) {
     token = xApiKey;
@@ -211,25 +373,76 @@ inferenceRoutes.post('/inference', async (c) => {
     }
   }
 
+  let authMode: string | undefined;
+  let oauthExpires: number | undefined;
+  if (req.provider === 'openai') {
+    try {
+      const openaiAuth = resolveOpenAIAuth(apiKey);
+      authMode = openaiAuth.mode;
+      oauthExpires = openaiAuth.expires;
+    } catch (e) {
+      const error = e instanceof Error ? e.message : 'Invalid OpenAI auth material';
+      db.logAudit(c.env.db, agent.account_id, agent.id, 'inference.request', capabilityName, 'denied', null, error);
+      return c.json({ error }, 400);
+    }
+  }
+
   // 5. Log the request (no content — privacy)
   db.logAudit(
     c.env.db, agent.account_id, agent.id,
     'inference.request', capabilityName, 'pending',
     c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || null,
-    JSON.stringify({ model: req.model, stream: req.stream !== false, messageCount: req.messages.length })
+    JSON.stringify({
+      model: req.model,
+      stream: req.stream !== false,
+      messageCount: req.messages.length,
+      authMode,
+      oauthExpires,
+    })
   );
 
   // 6. Build provider request
-  const providerBody = providerConfig.buildBody(req);
-  const url = `${providerConfig.baseUrl}${providerConfig.messagesPath}`;
+  let providerBody: Record<string, unknown> = providerConfig.buildBody(req);
+  let url = `${providerConfig.baseUrl}${providerConfig.messagesPath}`;
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
   };
+  let openaiAuthForRetry: { authHeaderValue: string; mode: OpenAITokenType; expires?: number; bundle?: OpenAIOAuthBundle } | undefined;
 
-  // Dynamic auth headers — Anthropic needs token-type detection (API key vs OAuth)
+  // Dynamic auth headers — provider-specific token handling
   if (req.provider === 'anthropic') {
     Object.assign(headers, buildAnthropicAuthHeaders(apiKey));
+  } else if (req.provider === 'openai') {
+    let openaiAuth = resolveOpenAIAuth(apiKey);
+    if (openaiAuth.expires && Date.now() > openaiAuth.expires && openaiAuth.bundle?.refresh) {
+      const refreshed = await refreshOpenAICodexBundle(openaiAuth.bundle);
+      if (refreshed) {
+        persistOpenAICodexBundle(c, agent, refreshed);
+        openaiAuth = {
+          authHeaderValue: `Bearer ${refreshed.access}`,
+          mode: 'oauth-bundle',
+          expires: refreshed.expires,
+          bundle: refreshed,
+        };
+      }
+    }
+    if (openaiAuth.expires && Date.now() > openaiAuth.expires) {
+      return c.json({ error: 'OpenAI OAuth token appears expired in broker secret; re-auth required.' }, 401);
+    }
+    openaiAuthForRetry = openaiAuth;
+    headers['Authorization'] = openaiAuth.authHeaderValue;
+
+    // Codex OAuth parity path (mirrors OpenClaw codex backend behavior)
+    if (openaiAuth.mode === 'oauth-bundle') {
+      url = 'https://chatgpt.com/backend-api/codex/responses';
+      providerBody = buildOpenAICodexBody(req);
+      headers['User-Agent'] = 'CodexBar';
+      headers['Accept'] = 'text/event-stream';
+      if (openaiAuth.bundle?.accountId) {
+        headers['ChatGPT-Account-Id'] = openaiAuth.bundle.accountId;
+      }
+    }
   } else {
     // Generic provider auth
     if (providerConfig.extraHeaders) Object.assign(headers, providerConfig.extraHeaders);
@@ -242,11 +455,24 @@ inferenceRoutes.post('/inference', async (c) => {
 
   // 7. Proxy the request
   try {
-    const response = await fetch(url, {
+    let response = await fetch(url, {
       method: 'POST',
       headers,
       body: JSON.stringify(providerBody),
     });
+
+    if (req.provider === 'openai' && response.status === 401 && openaiAuthForRetry?.bundle?.refresh) {
+      const refreshed = await refreshOpenAICodexBundle(openaiAuthForRetry.bundle);
+      if (refreshed) {
+        persistOpenAICodexBundle(c, agent, refreshed);
+        headers['Authorization'] = `Bearer ${refreshed.access}`;
+        response = await fetch(url, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(providerBody),
+        });
+      }
+    }
 
     const latencyMs = Date.now() - startTime;
 
@@ -265,7 +491,9 @@ inferenceRoutes.post('/inference', async (c) => {
     }
 
     // 8. Stream the response back
-    if (req.stream !== false && response.headers.get('Content-Type')?.includes('text/event-stream')) {
+    const forceStream = req.provider === 'openai' && openaiAuthForRetry?.mode === 'oauth-bundle';
+    const upstreamIsSse = response.headers.get('Content-Type')?.includes('text/event-stream') ?? false;
+    if ((req.stream !== false || forceStream) && (upstreamIsSse || forceStream)) {
       // SSE streaming — passthrough the stream, log completion after
       db.logAudit(
         c.env.db, agent.account_id, agent.id,
@@ -479,11 +707,32 @@ inferenceRoutes.post('/proxy/anthropic/*', async (c) => {
         });
       }
 
-      // SSE streaming passthrough
+      // SSE streaming passthrough — tee into inference tap
       if (response.headers.get('Content-Type')?.includes('text/event-stream')) {
         db.logAudit(c.env.db, agent.account_id, agent.id, 'proxy.streaming', 'inference/anthropic', 'success', null,
           JSON.stringify({ model, latencyMs, keyIndex: attempt + 1, totalKeys: apiKeys.length }));
-        return new Response(response.body, {
+
+        const { inferenceTap } = await import('./inference-tap.js');
+        const now = new Date().toISOString();
+        inferenceTap.publish({ agentId: agent.id, agentName: agent.name, provider: 'anthropic', method: 'POST', path: providerPath, type: 'request', model, timestamp: now });
+
+        const reader = response.body!.getReader();
+        const decoder = new TextDecoder();
+        const stream = new ReadableStream({
+          async pull(controller) {
+            const { done, value } = await reader.read();
+            if (done) {
+              inferenceTap.publish({ agentId: agent.id, agentName: agent.name, provider: 'anthropic', method: 'POST', path: providerPath, type: 'complete', model, timestamp: new Date().toISOString() });
+              controller.close();
+              return;
+            }
+            controller.enqueue(value);
+            const text = decoder.decode(value, { stream: true });
+            inferenceTap.publish({ agentId: agent.id, agentName: agent.name, provider: 'anthropic', method: 'POST', path: providerPath, type: 'chunk', data: text, model, timestamp: new Date().toISOString() });
+          },
+        });
+
+        return new Response(stream, {
           status: 200,
           headers: {
             'Content-Type': 'text/event-stream',
@@ -497,6 +746,10 @@ inferenceRoutes.post('/proxy/anthropic/*', async (c) => {
       const responseBody = await response.text();
       db.logAudit(c.env.db, agent.account_id, agent.id, 'proxy.complete', 'inference/anthropic', 'success', null,
         JSON.stringify({ model, latencyMs, keyIndex: attempt + 1, totalKeys: apiKeys.length }));
+
+      const { inferenceTap: tap } = await import('./inference-tap.js');
+      tap.publish({ agentId: agent.id, agentName: agent.name, provider: 'anthropic', method: 'POST', path: providerPath, type: 'complete', data: responseBody, model, timestamp: new Date().toISOString() });
+
       return new Response(responseBody, {
         status: 200,
         headers: { 'Content-Type': response.headers.get('Content-Type') || 'application/json' },
@@ -528,28 +781,120 @@ inferenceRoutes.post('/proxy/openai/*', async (c) => {
     return c.json({ error: result.error }, result.status as any);
   }
 
+  let openaiAuth: { authHeaderValue: string; mode: OpenAITokenType; expires?: number; bundle?: OpenAIOAuthBundle };
+  try {
+    openaiAuth = resolveOpenAIAuth(result.apiKey);
+  } catch (e) {
+    const error = e instanceof Error ? e.message : 'Invalid OpenAI auth material';
+    db.logAudit(c.env.db, agent.account_id, agent.id, 'proxy.request', 'inference/openai', 'denied', null, error);
+    return c.json({ error }, 400);
+  }
+
+  if (openaiAuth.expires && Date.now() > openaiAuth.expires && openaiAuth.bundle?.refresh) {
+    const refreshed = await refreshOpenAICodexBundle(openaiAuth.bundle);
+    if (refreshed) {
+      persistOpenAICodexBundle(c, agent, refreshed);
+      openaiAuth = {
+        authHeaderValue: `Bearer ${refreshed.access}`,
+        mode: 'oauth-bundle',
+        expires: refreshed.expires,
+        bundle: refreshed,
+      };
+    }
+  }
+
+  if (openaiAuth.expires && Date.now() > openaiAuth.expires) {
+    const error = 'OpenAI OAuth token appears expired in broker secret; re-auth required.';
+    db.logAudit(c.env.db, agent.account_id, agent.id, 'proxy.request', 'inference/openai', 'denied', null, error);
+    return c.json({ error }, 401);
+  }
+
   const fullPath = c.req.path;
-  const providerPath = fullPath.replace(/^\/v1\/proxy\/openai/, '');
-  const url = `https://api.openai.com${providerPath}`;
+  const rawProviderPath = fullPath.replace(/^\/v1\/proxy\/openai/, '');
+  // Some clients use /embeddings while OpenAI expects /v1/embeddings.
+  const providerPath = rawProviderPath === '/embeddings' ? '/v1/embeddings' : rawProviderPath;
 
   const requestBody = await c.req.raw.clone().text();
   const contentType = c.req.header('content-type') || 'application/json';
 
   let model = 'unknown';
-  try { model = JSON.parse(requestBody).model || 'unknown'; } catch {}
+  let parsedBody: Record<string, unknown> | null = null;
+  try { parsedBody = JSON.parse(requestBody); model = (parsedBody as any)?.model || 'unknown'; } catch {}
+
+  // Embeddings cannot be served by Codex OAuth backend. If this is an embedding
+  // request and OPENAI_TOKEN is oauth-bundle, switch to OPENAI_API_KEY.
+  const isEmbeddingRequest = providerPath.startsWith('/v1/embeddings') || model.includes('embedding');
+  let effectiveAuthHeader = openaiAuth.authHeaderValue;
+  let effectiveAuthMode: OpenAITokenType = openaiAuth.mode;
+  if (isEmbeddingRequest && openaiAuth.mode === 'oauth-bundle') {
+    const embeddingSecret = db.getSecret(c.env.db, agent.account_id, 'OPENAI_API_KEY', agent.id);
+    if (!embeddingSecret) {
+      const error = 'Embedding request requires OPENAI_API_KEY in broker secret store (OPENAI_TOKEN oauth bundle cannot access embeddings).';
+      db.logAudit(c.env.db, agent.account_id, agent.id, 'proxy.request', 'inference/openai', 'denied', null, error);
+      return c.json({ error }, 400);
+    }
+    try {
+      const embeddingKey = decrypt(embeddingSecret.encrypted_value, c.env.masterKey);
+      effectiveAuthHeader = `Bearer ${embeddingKey}`;
+      effectiveAuthMode = 'api-key';
+    } catch {
+      return c.json({ error: 'Failed to decrypt OPENAI_API_KEY' }, 500);
+    }
+  }
+
+  // Codex OAuth parity: rewrite to chatgpt.com/backend-api/codex/responses
+  const shouldUseCodexBackend = effectiveAuthMode === 'oauth-bundle';
+  let url: string;
+  let finalBody: string;
+  const headers: Record<string, string> = {
+    'Authorization': effectiveAuthHeader,
+  };
+
+  if (shouldUseCodexBackend && parsedBody) {
+    url = 'https://chatgpt.com/backend-api/codex/responses';
+    // Build Codex-compatible body from the OpenAI Responses API shape
+    const codexBody: Record<string, unknown> = {
+      model: model,
+      instructions: (parsedBody as any).instructions ?? 'You are a helpful assistant.',
+      input: (parsedBody as any).input ?? [],
+      stream: true,
+      store: false,
+    };
+    finalBody = JSON.stringify(codexBody);
+    headers['Content-Type'] = 'application/json';
+    headers['User-Agent'] = 'CodexBar';
+    headers['Accept'] = 'text/event-stream';
+    if (openaiAuth.bundle?.accountId) {
+      headers['ChatGPT-Account-Id'] = openaiAuth.bundle.accountId;
+    }
+  } else {
+    url = `https://api.openai.com${providerPath}`;
+    finalBody = requestBody;
+    headers['Content-Type'] = contentType;
+  }
 
   db.logAudit(c.env.db, agent.account_id, agent.id, 'proxy.request', 'inference/openai', 'pending', null,
-    JSON.stringify({ model, path: providerPath }));
+    JSON.stringify({ model, path: shouldUseCodexBackend ? '/codex/responses' : providerPath, authMode: effectiveAuthMode, oauthExpires: openaiAuth.expires }));
 
   try {
-    const response = await fetch(url, {
+    let response = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': contentType,
-        'Authorization': `Bearer ${result.apiKey}`,
-      },
-      body: requestBody,
+      headers,
+      body: finalBody,
     });
+
+    if (response.status === 401 && effectiveAuthMode === 'oauth-bundle' && openaiAuth.bundle?.refresh) {
+      const refreshed = await refreshOpenAICodexBundle(openaiAuth.bundle);
+      if (refreshed) {
+        persistOpenAICodexBundle(c, agent, refreshed);
+        headers['Authorization'] = `Bearer ${refreshed.access}`;
+        response = await fetch(url, {
+          method: 'POST',
+          headers,
+          body: finalBody,
+        });
+      }
+    }
 
     const latencyMs = Date.now() - startTime;
 
@@ -563,7 +908,8 @@ inferenceRoutes.post('/proxy/openai/*', async (c) => {
       });
     }
 
-    if (response.headers.get('Content-Type')?.includes('text/event-stream')) {
+    const upstreamCt = response.headers.get('Content-Type') || '';
+    if (upstreamCt.includes('text/event-stream') || shouldUseCodexBackend) {
       db.logAudit(c.env.db, agent.account_id, agent.id, 'proxy.streaming', 'inference/openai', 'success', null,
         JSON.stringify({ model, latencyMs }));
       return new Response(response.body, {
