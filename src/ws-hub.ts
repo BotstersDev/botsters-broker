@@ -7,10 +7,11 @@ import type { Duplex } from 'node:stream';
 import { WebSocketServer, WebSocket } from 'ws';
 import type Database from 'better-sqlite3';
 import * as db from './db.js';
-import { hashToken } from './crypto.js';
-import { serialize, deserialize, makeError } from './protocol.js';
+import { serialize, deserialize } from './protocol.js';
+import type { WakeDelivery } from './protocol.js';
 import type { CommandRouter } from './command-router.js';
 import type { BrokerConfig } from './config.js';
+import { actuatorTap } from './actuator-tap.js';
 
 export interface Connection {
   ws: WebSocket;
@@ -18,6 +19,7 @@ export interface Connection {
   accountId: string;
   role: 'brain' | 'actuator';
   actuatorId?: string;
+  assignedAgentIds?: string[];
   capabilities?: string[];
   connId: string;
   alive: boolean;
@@ -27,7 +29,8 @@ export class WsHub {
   private wss: WebSocketServer;
   private connections = new Map<string, Connection>();
   private agentBrains = new Map<string, string>(); // agentId → connId
-  private agentActuators = new Map<string, Map<string, string>>(); // agentId → (actuatorId → connId)
+  private actuatorConnections = new Map<string, string>(); // actuatorId -> connId
+  private wakeBuffer = new Map<string, WakeDelivery[]>(); // agentId -> buffered wake events
   private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
   private router!: CommandRouter;
 
@@ -78,20 +81,21 @@ export class WsHub {
     // Authenticate — try agent token first, then actuator token
     let agentId: string;
     let accountId: string;
+    let assignedAgentIds: string[] | undefined;
 
     const agent = db.getAgentByToken(this.database, token);
     if (agent) {
       agentId = agent.id;
       accountId = agent.account_id;
 
-      // For actuator role with agent token, verify actuator belongs to this agent
+      // For actuator role with agent token, verify actuator is assigned to this agent.
       if (role === 'actuator') {
-        const actuator = db.getActuatorById(this.database, actuatorId!);
-        if (!actuator || actuator.agent_id !== agent.id) {
+        if (!db.isActuatorAssignedToAgent(this.database, agent.id, actuatorId!)) {
           socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
           socket.destroy();
           return;
         }
+        assignedAgentIds = db.getEnabledAgentIdsForActuator(this.database, actuatorId!);
       }
     } else if (role === 'actuator' && token.startsWith('seks_actuator_')) {
       // Try actuator-specific token
@@ -101,8 +105,7 @@ export class WsHub {
         socket.destroy();
         return;
       }
-      // Look up the owning agent to get account_id
-      const ownerAgent = db.getAgentById(this.database, actuator.agent_id);
+      const ownerAgent = db.resolveAgentForActuator(this.database, actuator.id);
       if (!ownerAgent) {
         socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
         socket.destroy();
@@ -110,6 +113,7 @@ export class WsHub {
       }
       agentId = ownerAgent.id;
       accountId = ownerAgent.account_id;
+      assignedAgentIds = db.getEnabledAgentIdsForActuator(this.database, actuator.id);
     } else {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
@@ -117,15 +121,15 @@ export class WsHub {
     }
 
     this.wss.handleUpgrade(request, socket, head, (ws) => {
-      this.onConnection(ws, agentId, accountId, role, actuatorId ?? undefined);
+      this.onConnection(ws, agentId, accountId, role, actuatorId ?? undefined, assignedAgentIds);
     });
   }
 
-  private onConnection(ws: WebSocket, agentId: string, accountId: string, role: 'brain' | 'actuator', actuatorId?: string) {
+  private onConnection(ws: WebSocket, agentId: string, accountId: string, role: 'brain' | 'actuator', actuatorId?: string, assignedAgentIds?: string[]) {
     const connId = `${role}_${agentId}_${actuatorId || 'brain'}_${Date.now()}`;
     const capabilities = actuatorId ? db.listCapabilities(this.database, actuatorId).map(c => c.capability) : undefined;
 
-    const conn: Connection = { ws, agentId, accountId, role, actuatorId, capabilities, connId, alive: true };
+    const conn: Connection = { ws, agentId, accountId, role, actuatorId, assignedAgentIds, capabilities, connId, alive: true };
     this.connections.set(connId, conn);
 
     if (role === 'brain') {
@@ -137,23 +141,44 @@ export class WsHub {
       }
       this.agentBrains.set(agentId, connId);
     } else if (role === 'actuator' && actuatorId) {
-      if (!this.agentActuators.has(agentId)) this.agentActuators.set(agentId, new Map());
-      const existingId = this.agentActuators.get(agentId)!.get(actuatorId);
+      const existingId = this.actuatorConnections.get(actuatorId);
       if (existingId) {
         const existing = this.connections.get(existingId);
         if (existing) existing.ws.close(1008, 'Replaced by new connection');
       }
-      this.agentActuators.get(agentId)!.set(actuatorId, connId);
+      this.actuatorConnections.set(actuatorId, connId);
       db.updateActuatorStatus(this.database, actuatorId, 'online');
+      const actuator = db.getActuatorById(this.database, actuatorId);
+      actuatorTap.publish({
+        actuatorId,
+        actuatorName: actuator?.name || actuatorId,
+        timestamp: new Date().toISOString(),
+        type: 'connect',
+      });
 
-      // Notify brain
-      const brainConn = this.getBrainConnection(agentId);
-      if (brainConn) {
-        brainConn.ws.send(serialize({ type: 'actuator_online', actuator_id: actuatorId, name: '', capabilities: capabilities || [] }));
+      // Notify assigned brains
+      const notifyAgents = assignedAgentIds || db.getEnabledAgentIdsForActuator(this.database, actuatorId);
+      for (const assignedAgentId of notifyAgents) {
+        const brainConn = this.getBrainConnection(assignedAgentId);
+        if (brainConn) {
+          brainConn.ws.send(serialize({ type: 'actuator_online', actuator_id: actuatorId, name: '', capabilities: capabilities || [] }));
+        }
       }
 
       // Deliver queued commands
-      if (this.router) this.router.deliverQueuedCommands(agentId, actuatorId);
+      if (this.router) {
+        for (const assignedAgentId of notifyAgents) {
+          this.router.deliverQueuedCommands(assignedAgentId, actuatorId);
+        }
+      }
+
+      if (actuator?.type === 'brain') {
+        const ownerAgent = db.getAgentById(this.database, agentId);
+        console.log(`[ws-hub] Brain actuator connected: ${actuatorId} for agent ${ownerAgent?.name || agentId}`);
+        for (const assignedAgentId of notifyAgents) {
+          this.flushBufferedWakes(assignedAgentId, conn);
+        }
+      }
     }
 
     db.updateAgentLastSeen(this.database, agentId);
@@ -177,7 +202,8 @@ export class WsHub {
         break;
       case 'command_result':
         if (conn.role !== 'actuator') return;
-        this.router?.handleCommandResult(conn.agentId, msg);
+        if (!conn.actuatorId) return;
+        this.router?.handleCommandResult(conn.actuatorId, msg);
         break;
       case 'credential_request':
         this.router?.handleCredentialRequest(conn.agentId, conn.accountId, msg, conn.ws);
@@ -201,16 +227,25 @@ export class WsHub {
         this.agentBrains.delete(conn.agentId);
       }
     } else if (conn.role === 'actuator' && conn.actuatorId) {
-      const actuatorMap = this.agentActuators.get(conn.agentId);
-      if (actuatorMap?.get(conn.actuatorId) === connId) {
-        actuatorMap.delete(conn.actuatorId);
+      if (this.actuatorConnections.get(conn.actuatorId) === connId) {
+        this.actuatorConnections.delete(conn.actuatorId);
       }
       db.updateActuatorStatus(this.database, conn.actuatorId, 'offline');
+      const actuator = db.getActuatorById(this.database, conn.actuatorId);
+      actuatorTap.publish({
+        actuatorId: conn.actuatorId,
+        actuatorName: actuator?.name || conn.actuatorId,
+        timestamp: new Date().toISOString(),
+        type: 'disconnect',
+      });
 
-      // Notify brain
-      const brainConn = this.getBrainConnection(conn.agentId);
-      if (brainConn) {
-        brainConn.ws.send(serialize({ type: 'actuator_offline', actuator_id: conn.actuatorId, reason: 'disconnected' }));
+      // Notify assigned brains
+      const notifyAgents = conn.assignedAgentIds || db.getEnabledAgentIdsForActuator(this.database, conn.actuatorId);
+      for (const assignedAgentId of notifyAgents) {
+        const brainConn = this.getBrainConnection(assignedAgentId);
+        if (brainConn) {
+          brainConn.ws.send(serialize({ type: 'actuator_offline', actuator_id: conn.actuatorId, reason: 'disconnected' }));
+        }
       }
     }
   }
@@ -236,9 +271,40 @@ export class WsHub {
     return connId ? this.connections.get(connId) ?? null : null;
   }
 
-  getActuatorConnection(agentId: string, actuatorId: string): Connection | null {
-    const connId = this.agentActuators.get(agentId)?.get(actuatorId);
+  getActuatorConnection(agentId: string, actuatorId: string, includeDisabledAssignments: boolean = false): Connection | null {
+    if (!db.isActuatorAssignedToAgent(this.database, agentId, actuatorId, !includeDisabledAssignments)) return null;
+    const connId = this.actuatorConnections.get(actuatorId);
     return connId ? this.connections.get(connId) ?? null : null;
+  }
+
+  bufferWakeMessage(agentId: string, text: string, source: string, ts?: string): WakeDelivery {
+    const wake: WakeDelivery = {
+      type: 'wake',
+      text,
+      source,
+      ts: ts || new Date().toISOString(),
+    };
+
+    const existing = this.wakeBuffer.get(agentId) || [];
+    existing.push(wake);
+    while (existing.length > 5) {
+      existing.shift();
+    }
+    this.wakeBuffer.set(agentId, existing);
+
+    return wake;
+  }
+
+  flushBufferedWakes(agentId: string, conn: Connection): number {
+    if (conn.role !== 'actuator') return 0;
+    const buffered = this.wakeBuffer.get(agentId);
+    if (!buffered || buffered.length === 0) return 0;
+
+    for (const wake of buffered) {
+      conn.ws.send(serialize(wake));
+    }
+    this.wakeBuffer.delete(agentId);
+    return buffered.length;
   }
 
   getActiveConnections(): Connection[] {
