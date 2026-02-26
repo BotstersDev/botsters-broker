@@ -353,6 +353,7 @@ webRoutes.get('/dashboard', (c) => {
           <div class="stat"><div class="stat-value">${actuators.length}</div><div class="stat-label">Actuators</div></div>
           <div class="stat"><div class="stat-value">${actuators.filter(a => a.status === 'online').length}</div><div class="stat-label">Online</div></div>
         </div>
+        ${raw(db.getGlobalSafe(c.env.db) ? '<div class="card" style="background:#2d1518;border:2px solid #e53e3e;margin-bottom:1rem;padding:1rem;"><div style="display:flex;align-items:center;justify-content:space-between;"><div><strong style="color:#e53e3e;font-size:1.1rem;">SAFE MODE ACTIVE</strong><p style="margin:0.25rem 0 0;color:#999;">All actuator commands are blocked.</p></div><form method="POST" action="/dashboard/safe"><button type="submit" class="btn btn-primary">Deactivate Safe Mode</button></form></div></div>' : '<div style="margin-bottom:1rem;"><form method="POST" action="/dashboard/safe"><button type="submit" class="btn btn-danger btn-sm">Activate Safe Mode</button></form></div>')}
         <div class="card">
           <h2>Quick Start</h2>
           <ol style="padding-left: 1.5rem; color: var(--text-muted);">
@@ -683,6 +684,7 @@ webRoutes.get('/agents', (c) => {
       <td class="text-muted">${a.last_seen_at?.split('T')[0] || 'Never'}</td>
       <td>
         <div class="flex gap-2">
+          <form method="POST" action="/agents/${a.id}/safe" style="margin:0;"><button type="submit" class="btn ${(a as any).safe ? 'btn-danger' : 'btn-ghost'} btn-sm">${(a as any).safe ? '🔴 SAFE' : '⚡ Live'}</button></form>
           <a href="/agents/${a.id}" class="btn btn-ghost btn-sm">Proxy Tokens</a>
           <a href="/agents/${a.id}/live" class="btn btn-ghost btn-sm">Live</a>
           <form method="POST" action="/agents/${a.id}/delete" onsubmit="return confirm('Delete this agent?');" style="margin: 0;">
@@ -708,7 +710,7 @@ webRoutes.get('/agents', (c) => {
           <h3>Your Agents</h3>
           ${agents.length === 0 ? html`<div class="empty"><p>No agents created yet</p></div>` : html`
             <table>
-              <thead><tr><th>Name</th><th>Token Hash</th><th>Created</th><th>Last Seen</th><th></th></tr></thead>
+              <thead><tr><th>Name</th><th>Token Hash</th><th>Created</th><th>Last Seen</th><th>Status</th><th></th></tr></thead>
               <tbody>${rows}</tbody>
             </table>
           `}
@@ -717,6 +719,26 @@ webRoutes.get('/agents', (c) => {
     </main>
   `;
   return c.html(layout('Agents', content, navBar('agents')));
+});
+
+webRoutes.post('/agents/:id/safe', (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
+  const agentId = c.req.param('id');
+  const agent = db.getAgentById(c.env.db, agentId);
+  if (!agent || agent.account_id !== accountId) return redirect('/agents');
+  db.setAgentSafe(c.env.db, agentId, !(agent as any).safe);
+  db.logAudit(c.env.db, accountId, agentId, (agent as any).safe ? 'agent.safe.off' : 'agent.safe.on', 'agent', 'success');
+  return redirect('/agents');
+});
+
+webRoutes.post('/dashboard/safe', (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
+  const current = db.getGlobalSafe(c.env.db);
+  db.setGlobalSafe(c.env.db, !current);
+  db.logAudit(c.env.db, accountId, null, current ? 'broker.safe.off' : 'broker.safe.on', 'broker', 'success');
+  return redirect('/dashboard');
 });
 
 webRoutes.post('/agents/add', async (c) => {
