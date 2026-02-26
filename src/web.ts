@@ -217,6 +217,123 @@ webRoutes.post('/logout', (c) => {
   return redirect('/login');
 });
 
+webRoutes.get('/api/inference/stream', async (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return c.json({ error: 'Unauthorized' }, 401);
+
+  const agentId = c.req.query('agent_id') || null;
+
+  if (agentId) {
+    const agent = db.getAgentById(c.env.db, agentId);
+    if (!agent || agent.account_id !== accountId) return c.json({ error: 'Not found' }, 404);
+  }
+
+  const { inferenceTap } = await import('./inference-tap.js');
+
+  let cleanup: (() => void) | null = null;
+  const stream = new ReadableStream({
+    start(controller) {
+      const encoder = new TextEncoder();
+
+      const unsubscribe = inferenceTap.subscribe(agentId, (event) => {
+        const data = JSON.stringify(event);
+        controller.enqueue(encoder.encode(`data: ${data}\n\n`));
+      });
+
+      const keepalive = setInterval(() => {
+        try {
+          controller.enqueue(encoder.encode(': keepalive\n\n'));
+        } catch {
+          clearInterval(keepalive);
+        }
+      }, 30000);
+
+      cleanup = () => {
+        unsubscribe();
+        clearInterval(keepalive);
+      };
+
+      try {
+        c.req.raw.signal?.addEventListener?.('abort', () => {
+          cleanup?.();
+          cleanup = null;
+        });
+      } catch {
+        // best effort
+      }
+    },
+    cancel() {
+      cleanup?.();
+      cleanup = null;
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    },
+  });
+});
+
+webRoutes.get('/api/actuators/:id/stream', async (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return c.json({ error: 'Unauthorized' }, 401);
+
+  const actuatorId = c.req.param('id');
+  const actuator = db.getActuatorById(c.env.db, actuatorId);
+  if (!actuator || actuator.account_id !== accountId) return c.json({ error: 'Not found' }, 404);
+
+  const { actuatorTap } = await import('./actuator-tap.js');
+
+  let cleanup: (() => void) | null = null;
+  const stream = new ReadableStream({
+    start(controller) {
+      const encoder = new TextEncoder();
+
+      const unsubscribe = actuatorTap.subscribe(actuatorId, (event) => {
+        const data = JSON.stringify(event);
+        controller.enqueue(encoder.encode(`data: ${data}\n\n`));
+      });
+
+      const keepalive = setInterval(() => {
+        try {
+          controller.enqueue(encoder.encode(': keepalive\n\n'));
+        } catch {
+          clearInterval(keepalive);
+        }
+      }, 30000);
+
+      cleanup = () => {
+        unsubscribe();
+        clearInterval(keepalive);
+      };
+
+      try {
+        c.req.raw.signal?.addEventListener?.('abort', () => {
+          cleanup?.();
+          cleanup = null;
+        });
+      } catch {
+        // best effort
+      }
+    },
+    cancel() {
+      cleanup?.();
+      cleanup = null;
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    },
+  });
+});
+
 webRoutes.get('/dashboard', (c) => {
   const accountId = getSessionAccount(c);
   if (!accountId) return redirect('/login');
@@ -236,6 +353,7 @@ webRoutes.get('/dashboard', (c) => {
           <div class="stat"><div class="stat-value">${actuators.length}</div><div class="stat-label">Actuators</div></div>
           <div class="stat"><div class="stat-value">${actuators.filter(a => a.status === 'online').length}</div><div class="stat-label">Online</div></div>
         </div>
+        ${raw(db.getGlobalSafe(c.env.db) ? '<div class="card" style="background:#2d1518;border:2px solid #e53e3e;margin-bottom:1rem;padding:1rem;"><div style="display:flex;align-items:center;justify-content:space-between;"><div><strong style="color:#e53e3e;font-size:1.1rem;">SAFE MODE ACTIVE</strong><p style="margin:0.25rem 0 0;color:#999;">All actuator commands are blocked.</p></div><form method="POST" action="/dashboard/safe"><button type="submit" class="btn btn-primary">Deactivate Safe Mode</button></form></div></div>' : '<div style="margin-bottom:1rem;"><form method="POST" action="/dashboard/safe"><button type="submit" class="btn btn-danger btn-sm">Activate Safe Mode</button></form></div>')}
         <div class="card">
           <h2>Quick Start</h2>
           <ol style="padding-left: 1.5rem; color: var(--text-muted);">
@@ -566,7 +684,9 @@ webRoutes.get('/agents', (c) => {
       <td class="text-muted">${a.last_seen_at?.split('T')[0] || 'Never'}</td>
       <td>
         <div class="flex gap-2">
+          <form method="POST" action="/agents/${a.id}/safe" style="margin:0;"><button type="submit" class="btn ${(a as any).safe ? 'btn-danger' : 'btn-ghost'} btn-sm">${(a as any).safe ? '🔴 SAFE' : '⚡ Live'}</button></form>
           <a href="/agents/${a.id}" class="btn btn-ghost btn-sm">Proxy Tokens</a>
+          <a href="/agents/${a.id}/live" class="btn btn-ghost btn-sm">Live</a>
           <form method="POST" action="/agents/${a.id}/delete" onsubmit="return confirm('Delete this agent?');" style="margin: 0;">
             <button type="submit" class="btn btn-danger btn-sm">Delete</button>
           </form>
@@ -590,7 +710,7 @@ webRoutes.get('/agents', (c) => {
           <h3>Your Agents</h3>
           ${agents.length === 0 ? html`<div class="empty"><p>No agents created yet</p></div>` : html`
             <table>
-              <thead><tr><th>Name</th><th>Token Hash</th><th>Created</th><th>Last Seen</th><th></th></tr></thead>
+              <thead><tr><th>Name</th><th>Token Hash</th><th>Created</th><th>Last Seen</th><th>Status</th><th></th></tr></thead>
               <tbody>${rows}</tbody>
             </table>
           `}
@@ -599,6 +719,26 @@ webRoutes.get('/agents', (c) => {
     </main>
   `;
   return c.html(layout('Agents', content, navBar('agents')));
+});
+
+webRoutes.post('/agents/:id/safe', (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
+  const agentId = c.req.param('id');
+  const agent = db.getAgentById(c.env.db, agentId);
+  if (!agent || agent.account_id !== accountId) return redirect('/agents');
+  db.setAgentSafe(c.env.db, agentId, !(agent as any).safe);
+  db.logAudit(c.env.db, accountId, agentId, (agent as any).safe ? 'agent.safe.off' : 'agent.safe.on', 'agent', 'success');
+  return redirect('/agents');
+});
+
+webRoutes.post('/dashboard/safe', (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
+  const current = db.getGlobalSafe(c.env.db);
+  db.setGlobalSafe(c.env.db, !current);
+  db.logAudit(c.env.db, accountId, null, current ? 'broker.safe.off' : 'broker.safe.on', 'broker', 'success');
+  return redirect('/dashboard');
 });
 
 webRoutes.post('/agents/add', async (c) => {
@@ -636,6 +776,133 @@ webRoutes.post('/agents/:id/delete', (c) => {
   if (!accountId) return redirect('/login');
   db.deleteAgent(c.env.db, c.req.param('id'), accountId);
   return redirect('/agents');
+});
+
+webRoutes.get('/agents/:id/live', (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
+  const id = c.req.param('id');
+  const agents = db.listAgents(c.env.db, accountId);
+  const agent = agents.find(a => a.id === id);
+  if (!agent) return redirect('/agents');
+
+  const content = html`
+    <main>
+      <div class="container">
+        <div class="flex justify-between items-center mb-2">
+          <h1>Live Inference: ${agent.name}</h1>
+          <div class="flex gap-2">
+            <button onclick="clearLog()" class="btn btn-ghost btn-sm">Clear</button>
+            <button onclick="togglePause()" class="btn btn-ghost btn-sm" id="pauseBtn">Pause</button>
+            <a href="/agents" class="btn btn-ghost btn-sm">← Back</a>
+          </div>
+        </div>
+        <div class="card" style="padding:0;">
+          <div id="log" style="
+            font-family: 'SF Mono', 'Fira Code', monospace;
+            font-size: 0.8125rem;
+            line-height: 1.5;
+            background: #0a0a0a;
+            color: #d4d4d4;
+            padding: 1rem;
+            height: 70vh;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-word;
+          ">
+            <div style="color: var(--text-muted);">Connecting to inference stream...</div>
+          </div>
+        </div>
+        <div style="margin-top:0.5rem; display:flex; justify-content:space-between; align-items:center;">
+          <span id="status" class="text-muted" style="font-size:0.875rem;">⏳ Connecting...</span>
+          <span id="stats" class="text-muted" style="font-size:0.875rem;"></span>
+        </div>
+      </div>
+    </main>
+    <script>
+      const log = document.getElementById('log');
+      const status = document.getElementById('status');
+      const stats = document.getElementById('stats');
+      let paused = false;
+      let chunks = 0;
+      let currentSpan = null;
+
+      function clearLog() { log.innerHTML = ''; currentSpan = null; chunks = 0; updateStats(); }
+      function togglePause() {
+        paused = !paused;
+        document.getElementById('pauseBtn').textContent = paused ? 'Resume' : 'Pause';
+      }
+      function updateStats() { stats.textContent = chunks + ' chunks'; }
+
+      function appendRequest(event) {
+        const div = document.createElement('div');
+        div.style.color = '#22c55e';
+        div.style.marginTop = '0.75rem';
+        div.style.borderTop = '1px solid #262626';
+        div.style.paddingTop = '0.5rem';
+        const ts = new Date(event.timestamp).toLocaleTimeString();
+        div.textContent = '[' + ts + '] ' + event.provider + ' ' + (event.data || '');
+        log.appendChild(div);
+        currentSpan = null;
+      }
+
+      function appendChunk(event) {
+        if (!currentSpan) {
+          currentSpan = document.createElement('span');
+          currentSpan.style.color = '#d4d4d4';
+          log.appendChild(currentSpan);
+        }
+        currentSpan.textContent += event.data || '';
+        chunks++;
+        updateStats();
+      }
+
+      function appendComplete(event) {
+        const div = document.createElement('div');
+        div.style.color = '#737373';
+        div.style.fontSize = '0.75rem';
+        const ts = new Date(event.timestamp).toLocaleTimeString();
+        div.textContent = '[' + ts + '] ✓ complete';
+        log.appendChild(div);
+        currentSpan = null;
+      }
+
+      function appendError(event) {
+        const div = document.createElement('div');
+        div.style.color = '#ef4444';
+        div.textContent = '✗ ERROR: ' + (event.data || 'unknown');
+        log.appendChild(div);
+        currentSpan = null;
+      }
+
+      function autoScroll() {
+        if (!paused) log.scrollTop = log.scrollHeight;
+      }
+
+      function trim() {
+        while (log.childNodes.length > 500) log.removeChild(log.firstChild);
+      }
+
+      const es = new EventSource('/api/inference/stream?agent_id=${id}');
+      es.onopen = () => { status.textContent = '🟢 Connected'; };
+      es.onerror = () => { status.textContent = '🔴 Disconnected — retrying...'; };
+      es.onmessage = (e) => {
+        if (paused) return;
+        try {
+          const event = JSON.parse(e.data);
+          switch (event.type) {
+            case 'request': appendRequest(event); break;
+            case 'chunk': appendChunk(event); break;
+            case 'complete': appendComplete(event); break;
+            case 'error': appendError(event); break;
+          }
+          autoScroll();
+          trim();
+        } catch {}
+      };
+    </script>
+  `;
+  return c.html(layout('Live Inference: ' + agent.name, content, navBar('agents')));
 });
 
 webRoutes.get('/agents/:id', (c) => {
@@ -736,8 +1003,13 @@ webRoutes.get('/actuators', (c) => {
   if (!accountId) return redirect('/login');
 
   const agents = db.listAgents(c.env.db, accountId);
-  const agentMap = new Map(agents.map(a => [a.id, a.name]));
   const actuators = db.listActuatorsByAccount(c.env.db, accountId);
+  const assignments = db.listAgentActuatorAssignmentsByAccount(c.env.db, accountId);
+  const assignmentsByActuator = new Map<string, typeof assignments>();
+  for (const assignment of assignments) {
+    if (!assignmentsByActuator.has(assignment.actuator_id)) assignmentsByActuator.set(assignment.actuator_id, []);
+    assignmentsByActuator.get(assignment.actuator_id)!.push(assignment);
+  }
 
   const rows = raw(actuators.map(a => {
     const caps = db.listCapabilities(c.env.db, a.id);
@@ -746,10 +1018,20 @@ webRoutes.get('/actuators', (c) => {
       : a.status === 'suspended'
       ? html`<span class="badge badge-danger">suspended</span>`
       : html`<span class="badge badge-muted">offline</span>`;
+    const actAssignments = assignmentsByActuator.get(a.id) || [];
     return html`
       <tr>
         <td><strong>${a.name}</strong></td>
-        <td class="text-muted">${agentMap.get(a.agent_id) || 'Unknown'}</td>
+        <td>
+          ${actAssignments.length > 0 ? raw(actAssignments.map(asg => `
+            <form method="POST" action="/actuators/${a.id}/toggle-assignment" style="display:inline-block;margin-right:0.25rem;">
+              <input type="hidden" name="agent_id" value="${asg.agent_id}">
+              <button type="submit" class="btn btn-ghost btn-sm" style="padding:0.25rem 0.5rem;">
+                ${(asg as any).agent_name}: ${asg.enabled ? 'enabled' : 'disabled'}
+              </button>
+            </form>
+          `).join('')) : html`<span class="text-muted">none</span>`}
+        </td>
         <td>${a.type}</td>
         <td>${statusBadge}</td>
         <td>${caps.length > 0 ? raw(caps.map(c => `<span class="badge badge-muted" style="margin-right: 0.25rem;">${c.capability}</span>`).join('')) : html`<span class="text-muted">none</span>`}</td>
@@ -776,7 +1058,8 @@ webRoutes.get('/actuators', (c) => {
           <h3>Register Actuator</h3>
           <form method="POST" action="/actuators/add" class="flex gap-2">
             <input type="text" name="name" placeholder="Actuator name" required style="flex: 2;">
-            <select name="agent_id" required style="flex: 1;">
+            <select name="agent_id" style="flex: 1;">
+              <option value="">Unassigned</option>
               ${raw(agents.map(a => `<option value="${a.id}">${a.name}</option>`).join(''))}
             </select>
             <select name="type" style="flex: 1;">
@@ -790,7 +1073,7 @@ webRoutes.get('/actuators', (c) => {
         <div class="card">
           ${actuators.length === 0 ? html`<div class="empty"><p>No actuators registered yet</p></div>` : html`
             <table>
-              <thead><tr><th>Name</th><th>Agent</th><th>Type</th><th>Status</th><th>Capabilities</th><th>Last Seen</th><th></th></tr></thead>
+              <thead><tr><th>Name</th><th>Assignments</th><th>Type</th><th>Status</th><th>Capabilities</th><th>Last Seen</th><th></th></tr></thead>
               <tbody>${rows}</tbody>
             </table>
           `}
@@ -806,15 +1089,122 @@ webRoutes.post('/actuators/add', async (c) => {
   if (!accountId) return redirect('/login');
   const body = await c.req.parseBody();
   const name = body.name as string;
-  const agentId = body.agent_id as string;
+  const agentId = (body.agent_id as string) || '';
   const type = body.type as string || 'vps';
-
-  // Verify agent belongs to this account
   const agents = db.listAgents(c.env.db, accountId);
-  if (!agents.find(a => a.id === agentId)) return redirect('/actuators');
+  if (agentId && !agents.find(a => a.id === agentId)) return redirect('/actuators');
 
-  db.createActuator(c.env.db, agentId, name, type);
+  db.createActuator(c.env.db, accountId, name, type, agentId || undefined);
   return redirect('/actuators');
+});
+
+webRoutes.get('/actuators/:id/live', (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
+  const id = c.req.param('id');
+  const actuator = db.getActuatorById(c.env.db, id);
+  if (!actuator || actuator.account_id !== accountId) return redirect('/actuators');
+
+  const content = html`
+    <main>
+      <div class="container">
+        <div class="flex justify-between items-center mb-2">
+          <h1>Live Log: ${actuator.name}</h1>
+          <div class="flex gap-2">
+            <button onclick="clearLog()" class="btn btn-ghost btn-sm">Clear</button>
+            <button onclick="togglePause()" class="btn btn-ghost btn-sm" id="pauseBtn">Pause</button>
+            <a href="/actuators/${id}" class="btn btn-ghost btn-sm">← Back</a>
+          </div>
+        </div>
+        <div class="card" style="padding:0;">
+          <div id="log" style="
+            font-family: 'SF Mono', 'Fira Code', monospace;
+            font-size: 0.8125rem;
+            line-height: 1.5;
+            background: #0a0a0a;
+            color: #d4d4d4;
+            padding: 1rem;
+            height: 70vh;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-word;
+          ">
+            <div style="color: var(--text-muted);">Connecting to actuator stream...</div>
+          </div>
+        </div>
+        <div style="margin-top:0.5rem; display:flex; justify-content:space-between; align-items:center;">
+          <span id="status" class="text-muted" style="font-size:0.875rem;">⏳ Connecting...</span>
+          <span id="stats" class="text-muted" style="font-size:0.875rem;"></span>
+        </div>
+      </div>
+    </main>
+    <script>
+      const log = document.getElementById('log');
+      const status = document.getElementById('status');
+      const stats = document.getElementById('stats');
+      let paused = false;
+      let chunks = 0;
+
+      function clearLog() { log.innerHTML = ''; chunks = 0; updateStats(); }
+      function togglePause() {
+        paused = !paused;
+        document.getElementById('pauseBtn').textContent = paused ? 'Resume' : 'Pause';
+      }
+      function updateStats() { stats.textContent = chunks + ' chunks'; }
+
+      function appendLine(text, color) {
+        const div = document.createElement('div');
+        div.style.color = color;
+        div.textContent = text;
+        log.appendChild(div);
+      }
+
+      function formatTime(ts) {
+        return new Date(ts).toLocaleTimeString();
+      }
+
+      function autoScroll() {
+        if (!paused) log.scrollTop = log.scrollHeight;
+      }
+
+      function trim() {
+        while (log.childNodes.length > 500) log.removeChild(log.firstChild);
+      }
+
+      const es = new EventSource('/api/actuators/${id}/stream');
+      es.onopen = () => { status.textContent = '🟢 Connected'; };
+      es.onerror = () => { status.textContent = '🔴 Disconnected — retrying...'; };
+      es.onmessage = (e) => {
+        if (paused) return;
+        try {
+          const event = JSON.parse(e.data);
+          const ts = event.timestamp ? '[' + formatTime(event.timestamp) + '] ' : '';
+          switch (event.type) {
+            case 'connect':
+              appendLine('▶ Connected: ' + (event.actuatorName || 'actuator'), '#22c55e');
+              break;
+            case 'disconnect':
+              appendLine('■ Disconnected', '#ef4444');
+              break;
+            case 'command':
+              appendLine(ts + '→ ' + (event.action || 'command') + ' (cmd:' + (event.commandId || '-') + ')', '#38bdf8');
+              break;
+            case 'result':
+              appendLine(ts + '← ' + (event.status || 'unknown') + ' (' + (event.durationMs ?? 0) + 'ms)', '#d4d4d4');
+              break;
+            case 'error':
+              appendLine('✗ ERROR: ' + (event.data || 'unknown'), '#ef4444');
+              break;
+          }
+          chunks++;
+          updateStats();
+          autoScroll();
+          trim();
+        } catch {}
+      };
+    </script>
+  `;
+  return c.html(layout('Live Log: ' + actuator.name, content, navBar('actuators')));
 });
 
 webRoutes.get('/actuators/:id', (c) => {
@@ -824,17 +1214,20 @@ webRoutes.get('/actuators/:id', (c) => {
   const actuator = db.getActuatorById(c.env.db, id);
   if (!actuator) return redirect('/actuators');
 
-  // Verify ownership
-  const agent = db.getAgentById(c.env.db, actuator.agent_id);
-  if (!agent || agent.account_id !== accountId) return redirect('/actuators');
+  if (actuator.account_id !== accountId) return redirect('/actuators');
 
   const caps = db.listCapabilities(c.env.db, id);
-  const commands = db.listRecentCommands(c.env.db, actuator.agent_id, 20);
-  const actuatorCommands = commands.filter(cmd => cmd.actuator_id === id || cmd.actuator_id === null);
+  const accountCommands = db.listRecentCommandsByAccount(c.env.db, accountId, 50);
+  const actuatorCommands = accountCommands.filter(cmd => cmd.actuator_id === id);
+  const assignments = db.listActuatorAssignments(c.env.db, id);
+  const agents = db.listAgents(c.env.db, accountId);
+  const agentMap = new Map(agents.map(a => [a.id, a.name]));
 
   const allCaps = ['git', 'docker', 'filesystem', 'shell', 'network', 'credential', 'admin'];
   const existingCaps = new Set(caps.map(c => c.capability));
   const availableCaps = allCaps.filter(c => !existingCaps.has(c));
+  const assignedAgentIds = new Set(assignments.map(a => a.agent_id));
+  const unassignedAgents = agents.filter(a => !assignedAgentIds.has(a.id));
 
   const capRows = raw(caps.map(cap => html`
     <tr>
@@ -863,19 +1256,59 @@ webRoutes.get('/actuators/:id', (c) => {
     `;
   }).join(''));
 
+  const assignmentRows = raw(assignments.map(asg => html`
+    <tr>
+      <td>${agentMap.get(asg.agent_id) || asg.agent_id}</td>
+      <td><span class="badge ${asg.enabled ? 'badge-success' : 'badge-danger'}">${asg.enabled ? 'enabled' : 'disabled'}</span></td>
+      <td class="text-muted">${asg.assigned_at.replace('T', ' ').split('.')[0]}</td>
+      <td>
+        <div class="flex gap-2">
+          <form method="POST" action="/actuators/${id}/toggle-assignment" style="margin:0;">
+            <input type="hidden" name="agent_id" value="${asg.agent_id}">
+            <button type="submit" class="btn btn-ghost btn-sm">Toggle</button>
+          </form>
+          <form method="POST" action="/actuators/${id}/unassign" style="margin:0;">
+            <input type="hidden" name="agent_id" value="${asg.agent_id}">
+            <button type="submit" class="btn btn-danger btn-sm">Unassign</button>
+          </form>
+        </div>
+      </td>
+    </tr>
+  `).join(''));
+
+  const auditEntries = db.listAudit(c.env.db, accountId, { limit: 30 });
+  const auditRows = raw(auditEntries.map(entry => {
+    const statusClass = entry.status === 'success' ? 'badge-success'
+      : entry.status === 'error' ? 'badge-danger'
+      : entry.status === 'denied' ? 'badge-danger'
+      : entry.status === 'retry' ? 'badge-warning'
+      : 'badge-muted';
+    return html`
+      <tr>
+        <td class="text-muted">${entry.created_at.replace('T', ' ').split('.')[0]}</td>
+        <td><code>${entry.action}</code></td>
+        <td>${entry.resource ? html`<code class="token">${entry.resource}</code>` : '-'}</td>
+        <td><span class="badge ${statusClass}">${entry.status}</span></td>
+        <td class="text-muted" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${entry.details || '-'}</td>
+      </tr>
+    `;
+  }).join(''));
+
   const content = html`
     <main>
       <div class="container">
         <div class="flex justify-between items-center mb-2">
           <h1>Actuator: ${actuator.name}</h1>
-          <a href="/actuators" class="btn btn-ghost">← Back</a>
+          <div class="flex gap-2">
+            <a href="/actuators/${id}/live" class="btn btn-primary btn-sm">Live Log</a>
+            <a href="/actuators" class="btn btn-ghost">← Back</a>
+          </div>
         </div>
         <div class="card">
           <h3>Details</h3>
           <p><strong>ID:</strong> <code class="token">${actuator.id}</code></p>
           <p><strong>Type:</strong> ${actuator.type}</p>
-          <p><strong>Status:</strong> <span class="badge ${actuator.status === 'online' ? 'badge-success' : 'badge-muted'}">${actuator.status}</span></p>
-          <p><strong>Agent:</strong> ${agent.name}</p>
+          <p><strong>Status:</strong> <span class="badge ${actuator.status === 'online' ? 'badge-success' : actuator.status === 'suspended' ? 'badge-danger' : 'badge-muted'}">${actuator.status}</span></p>
           <p><strong>Last Seen:</strong> ${actuator.last_seen_at || 'Never'}</p>
           ${raw((() => {
             if (actuator.encrypted_token) {
@@ -895,6 +1328,25 @@ webRoutes.get('/actuators/:id', (c) => {
           <form method="POST" action="/actuators/${actuator.id}/rotate-token" style="margin-top: 0.5rem;">
             <button type="submit" class="btn btn-ghost btn-sm" onclick="return confirm('Rotate actuator token? The old token will stop working immediately.');">Rotate Token</button>
           </form>
+        </div>
+        <div class="card">
+          <h3>Assignments</h3>
+          ${assignments.length > 0 ? html`
+            <table>
+              <thead><tr><th>Agent</th><th>State</th><th>Assigned</th><th></th></tr></thead>
+              <tbody>${assignmentRows}</tbody>
+            </table>
+          ` : html`<p class="text-muted">No assignments</p>`}
+          ${unassignedAgents.length > 0 ? html`
+            <div style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--border);">
+              <form method="POST" action="/actuators/${id}/assign" class="flex gap-2">
+                <select name="agent_id" required style="flex: 1;">
+                  ${raw(unassignedAgents.map(a => `<option value="${a.id}">${a.name}</option>`).join(''))}
+                </select>
+                <button type="submit" class="btn btn-primary btn-sm">Assign</button>
+              </form>
+            </div>
+          ` : ''}
         </div>
         <div class="card">
           <h3>Capabilities</h3>
@@ -925,6 +1377,18 @@ webRoutes.get('/actuators/:id', (c) => {
             </table>
           ` : html`<p class="text-muted">No commands yet</p>`}
         </div>
+        <div class="card">
+          <div class="flex justify-between items-center">
+            <h3>Recent Activity</h3>
+            <a href="/activity" class="btn btn-ghost btn-sm">View All →</a>
+          </div>
+          ${auditEntries.length > 0 ? html`
+            <table>
+              <thead><tr><th>Time</th><th>Action</th><th>Resource</th><th>Status</th><th>Details</th></tr></thead>
+              <tbody>${auditRows}</tbody>
+            </table>
+          ` : html`<p class="text-muted">No activity yet</p>`}
+        </div>
       </div>
     </main>
   `;
@@ -937,10 +1401,54 @@ webRoutes.post('/actuators/:id/delete', (c) => {
   const id = c.req.param('id');
   const actuator = db.getActuatorById(c.env.db, id);
   if (!actuator) return redirect('/actuators');
-  const agent = db.getAgentById(c.env.db, actuator.agent_id);
-  if (!agent || agent.account_id !== accountId) return redirect('/actuators');
+  if (actuator.account_id !== accountId) return redirect('/actuators');
   db.deleteActuator(c.env.db, id);
   return redirect('/actuators');
+});
+
+webRoutes.post('/actuators/:id/toggle-assignment', async (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
+  const id = c.req.param('id');
+  const body = await c.req.parseBody();
+  const agentId = body.agent_id as string;
+  const actuator = db.getActuatorById(c.env.db, id);
+  if (!actuator) return redirect('/actuators');
+  if (actuator.account_id !== accountId) return redirect('/actuators');
+  const agent = db.getAgentById(c.env.db, agentId);
+  if (!agent || agent.account_id !== accountId) return redirect('/actuators');
+  db.toggleAgentActuatorAssignmentEnabled(c.env.db, agentId, id);
+  return redirect('/actuators');
+});
+
+webRoutes.post('/actuators/:id/assign', async (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
+  const id = c.req.param('id');
+  const body = await c.req.parseBody();
+  const agentId = body.agent_id as string;
+  const actuator = db.getActuatorById(c.env.db, id);
+  if (!actuator) return redirect('/actuators');
+  if (actuator.account_id !== accountId) return redirect('/actuators');
+  const agent = db.getAgentById(c.env.db, agentId);
+  if (!agent || agent.account_id !== accountId) return redirect('/actuators');
+  db.assignActuatorToAgent(c.env.db, agentId, id, 1);
+  return redirect(`/actuators/${id}`);
+});
+
+webRoutes.post('/actuators/:id/unassign', async (c) => {
+  const accountId = getSessionAccount(c);
+  if (!accountId) return redirect('/login');
+  const id = c.req.param('id');
+  const body = await c.req.parseBody();
+  const agentId = body.agent_id as string;
+  const actuator = db.getActuatorById(c.env.db, id);
+  if (!actuator) return redirect('/actuators');
+  if (actuator.account_id !== accountId) return redirect('/actuators');
+  const agent = db.getAgentById(c.env.db, agentId);
+  if (!agent || agent.account_id !== accountId) return redirect('/actuators');
+  db.removeActuatorAssignment(c.env.db, agentId, id);
+  return redirect(`/actuators/${id}`);
 });
 
 webRoutes.post('/actuators/:id/capabilities', async (c) => {
@@ -952,8 +1460,7 @@ webRoutes.post('/actuators/:id/capabilities', async (c) => {
   const constraints = body.constraints as string || undefined;
   const actuator = db.getActuatorById(c.env.db, id);
   if (!actuator) return redirect('/actuators');
-  const agent = db.getAgentById(c.env.db, actuator.agent_id);
-  if (!agent || agent.account_id !== accountId) return redirect('/actuators');
+  if (actuator.account_id !== accountId) return redirect('/actuators');
   db.addCapability(c.env.db, id, capability, constraints);
   return redirect(`/actuators/${id}`);
 });
@@ -965,8 +1472,7 @@ webRoutes.post('/actuators/:id/capabilities/:cap/delete', (c) => {
   const cap = c.req.param('cap');
   const actuator = db.getActuatorById(c.env.db, id);
   if (!actuator) return redirect('/actuators');
-  const agent = db.getAgentById(c.env.db, actuator.agent_id);
-  if (!agent || agent.account_id !== accountId) return redirect('/actuators');
+  if (actuator.account_id !== accountId) return redirect('/actuators');
   db.removeCapability(c.env.db, id, cap);
   return redirect(`/actuators/${id}`);
 });
@@ -977,8 +1483,7 @@ webRoutes.post('/actuators/:id/rotate-token', (c) => {
   const id = c.req.param('id');
   const actuator = db.getActuatorById(c.env.db, id);
   if (!actuator) return redirect('/actuators');
-  const agent = db.getAgentById(c.env.db, actuator.agent_id);
-  if (!agent || agent.account_id !== accountId) return redirect('/actuators');
+  if (actuator.account_id !== accountId) return redirect('/actuators');
   db.rotateActuatorToken(c.env.db, id, c.env.masterKey);
   return redirect(`/actuators/${id}`);
 });

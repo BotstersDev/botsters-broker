@@ -71,6 +71,13 @@ export interface ActuatorOffline {
   reason?: string;
 }
 
+export interface WakeDelivery {
+  type: 'wake';
+  text: string;
+  source: string;
+  ts: string;
+}
+
 export interface ErrorMessage {
   type: 'error';
   code: string;
@@ -89,6 +96,7 @@ export type BrokerMessage =
   | Pong
   | ActuatorOnline
   | ActuatorOffline
+  | WakeDelivery
   | ErrorMessage;
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────

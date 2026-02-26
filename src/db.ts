@@ -109,7 +109,7 @@ export function createSecret(db: Database.Database, accountId: string, name: str
     db.prepare('INSERT INTO secrets (id, account_id, name, provider, encrypted_value, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, accountId, name, provider, encryptedValue, now, now);
     return { id, account_id: accountId, name, provider, encrypted_value: encryptedValue, metadata: null, created_at: now, updated_at: now };
 }
-export function getSecretsByPrefix(db: Database.Database, accountId: string, namePrefix: string, agentId?: string): Secret[] {
+export function getSecretsByPrefix(db: Database.Database, accountId: string, namePrefix: string, agentId?: string | null): Secret[] {
     const pattern = `${namePrefix}%`;
     if (agentId) {
         return db.prepare(`
@@ -124,7 +124,7 @@ export function getSecretsByPrefix(db: Database.Database, accountId: string, nam
     }
     return db.prepare('SELECT * FROM secrets WHERE account_id = ? AND name LIKE ? ORDER BY name').all(accountId, pattern) as Secret[];
 }
-export function getSecret(db: Database.Database, accountId: string, name: string, agentId?: string): Secret | null {
+export function getSecret(db: Database.Database, accountId: string, name: string, agentId?: string | null): Secret | null {
     if (agentId) {
         return db.prepare(`
       SELECT s.* FROM secrets s
@@ -137,7 +137,7 @@ export function getSecret(db: Database.Database, accountId: string, name: string
     }
     return db.prepare('SELECT * FROM secrets WHERE account_id = ? AND name = ?').get(accountId, name) as Secret | undefined ?? null;
 }
-export function listSecrets(db: Database.Database, accountId: string, agentId?: string): Secret[] {
+export function listSecrets(db: Database.Database, accountId: string, agentId?: string | null): Secret[] {
     if (agentId) {
         return db.prepare(`
       SELECT s.* FROM secrets s
@@ -173,7 +173,7 @@ export function isSecretGlobal(db: Database.Database, secretId: string): boolean
     return row.count === 0;
 }
 // ─── Audit Log ─────────────────────────────────────────────────────────────────
-export function logAudit(db: Database.Database, accountId: string, agentId: string | null, action: string, resource: string | null, status: string, ipAddress?: string, details?: string): void {
+export function logAudit(db: Database.Database, accountId: string, agentId: string | null, action: string, resource: string | null, status: string, ipAddress?: string | null, details?: string | null): void {
     const id = generateId();
     const now = new Date().toISOString();
     db.prepare('INSERT INTO audit_log (id, account_id, agent_id, action, resource, status, ip_address, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, accountId, agentId, action, resource, status, ipAddress ?? null, details ?? null, now);
@@ -498,6 +498,12 @@ export function migrateMultiActuatorAssignments(db: Database.Database): void {
             AND aa.enabled = 1
         );
     `);
+    // Safe mode tables
+    if (!hasColumn(db, 'agents', 'safe')) {
+        db.exec('ALTER TABLE agents ADD COLUMN safe INTEGER NOT NULL DEFAULT 0');
+    }
+    db.exec("CREATE TABLE IF NOT EXISTS broker_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    db.exec("INSERT OR IGNORE INTO broker_settings (key, value) VALUES ('global_safe', '0')");
 }
 
 export function getAgentByName(db: Database.Database, name: string): Agent | null {
@@ -552,4 +558,24 @@ export function listAgentActuatorAssignmentsByAccount(db: Database.Database, acc
         JOIN agents ag ON ag.id = aa.agent_id
         WHERE ag.account_id = ?
     `).all(accountId) as Array<{ agent_id: string; actuator_id: string; enabled: number; assigned_at: string }>;
+}
+
+// ─── Safe Mode ─────────────────────────────────────────────────────────────────
+
+export function getAgentSafe(db: Database.Database, agentId: string): boolean {
+    const row = db.prepare('SELECT safe FROM agents WHERE id = ?').get(agentId) as { safe: number } | undefined;
+    return row ? !!row.safe : false;
+}
+
+export function setAgentSafe(db: Database.Database, agentId: string, safe: boolean): void {
+    db.prepare('UPDATE agents SET safe = ? WHERE id = ?').run(safe ? 1 : 0, agentId);
+}
+
+export function getGlobalSafe(db: Database.Database): boolean {
+    const row = db.prepare('SELECT value FROM broker_settings WHERE key = ?').get('global_safe') as { value: string } | undefined;
+    return row ? row.value === '1' : false;
+}
+
+export function setGlobalSafe(db: Database.Database, safe: boolean): void {
+    db.prepare('INSERT OR REPLACE INTO broker_settings (key, value) VALUES (?, ?)').run('global_safe', safe ? '1' : '0');
 }

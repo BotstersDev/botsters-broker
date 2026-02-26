@@ -235,38 +235,26 @@ describe('Actuators & Capabilities', () => {
     agentId = db.createAgent(testDb, accountId, 'Agent').id;
   });
 
-  it('creates actuator with assignment', () => {
-    const act = db.createActuator(testDb, accountId, 'My VPS', 'vps', agentId);
+  it('creates actuator', () => {
+    const act = db.createActuator(testDb, agentId, 'My VPS', 'vps');
     expect(act.id).toBeTruthy();
     expect(act.name).toBe('My VPS');
     expect(act.status).toBe('offline');
-    expect(act.agent_id).toBe('sentinel');
-    // Assignment row should exist
-    const assignments = db.listActuatorAssignments(testDb, act.id);
-    expect(assignments).toHaveLength(1);
-    expect(assignments[0].agent_id).toBe(agentId);
   });
 
-  it('creates actuator without initial agent', () => {
-    const act = db.createActuator(testDb, accountId, 'Unassigned VPS', 'vps');
-    expect(act.id).toBeTruthy();
-    const assignments = db.listActuatorAssignments(testDb, act.id);
-    expect(assignments).toHaveLength(0);
-  });
-
-  it('lists actuators for agent via assignments', () => {
-    db.createActuator(testDb, accountId, 'VPS 1', 'vps', agentId);
-    db.createActuator(testDb, accountId, 'VPS 2', 'vps', agentId);
+  it('lists actuators for agent', () => {
+    db.createActuator(testDb, agentId, 'VPS 1');
+    db.createActuator(testDb, agentId, 'VPS 2');
     expect(db.listActuators(testDb, agentId)).toHaveLength(2);
   });
 
-  it('lists actuators by account via assignments', () => {
-    db.createActuator(testDb, accountId, 'VPS 1', 'vps', agentId);
+  it('lists actuators by account', () => {
+    db.createActuator(testDb, agentId, 'VPS 1');
     expect(db.listActuatorsByAccount(testDb, accountId)).toHaveLength(1);
   });
 
   it('updates actuator status', () => {
-    const act = db.createActuator(testDb, accountId, 'VPS', 'vps', agentId);
+    const act = db.createActuator(testDb, agentId, 'VPS');
     db.updateActuatorStatus(testDb, act.id, 'online');
     const found = db.getActuatorById(testDb, act.id)!;
     expect(found.status).toBe('online');
@@ -274,7 +262,7 @@ describe('Actuators & Capabilities', () => {
   });
 
   it('manages capabilities', () => {
-    const act = db.createActuator(testDb, accountId, 'VPS', 'vps', agentId);
+    const act = db.createActuator(testDb, agentId, 'VPS');
     db.addCapability(testDb, act.id, 'git', '{"repos": ["*"]}');
     db.addCapability(testDb, act.id, 'shell');
     expect(db.listCapabilities(testDb, act.id)).toHaveLength(2);
@@ -282,60 +270,23 @@ describe('Actuators & Capabilities', () => {
     expect(db.listCapabilities(testDb, act.id)).toHaveLength(1);
   });
 
-  it('resolveActuatorForAgent auto-selects single non-brain actuator', () => {
-    const vps = db.createActuator(testDb, accountId, 'VPS', 'vps', agentId);
-    const brain = db.createActuator(testDb, accountId, 'Ego', 'brain', agentId);
-    const resolved = db.resolveActuatorForAgent(testDb, agentId);
-    expect(resolved).toBeTruthy();
-    expect(resolved!.id).toBe(vps.id);
-    // Should have persisted the selection
-    const agent = db.getAgentById(testDb, agentId)!;
-    expect(agent.selected_actuator_id).toBe(vps.id);
+  it('finds actuator with capability', () => {
+    const act = db.createActuator(testDb, agentId, 'VPS');
+    db.addCapability(testDb, act.id, 'git');
+    db.updateActuatorStatus(testDb, act.id, 'online');
+    const found = db.findActuatorWithCapability(testDb, agentId, 'git');
+    expect(found).toBeTruthy();
+    expect(found!.id).toBe(act.id);
   });
 
-  it('resolveActuatorForAgent returns null with multiple non-brain actuators', () => {
-    db.createActuator(testDb, accountId, 'VPS 1', 'vps', agentId);
-    db.createActuator(testDb, accountId, 'VPS 2', 'vps', agentId);
-    expect(db.resolveActuatorForAgent(testDb, agentId)).toBeNull();
-  });
-
-  it('resolveActuatorForAgent uses persisted selection', () => {
-    const vps1 = db.createActuator(testDb, accountId, 'VPS 1', 'vps', agentId);
-    db.createActuator(testDb, accountId, 'VPS 2', 'vps', agentId);
-    db.selectActuator(testDb, agentId, vps1.id);
-    const resolved = db.resolveActuatorForAgent(testDb, agentId);
-    expect(resolved).toBeTruthy();
-    expect(resolved!.id).toBe(vps1.id);
-  });
-
-  it('resolveActuatorForAgent explicit override returns null for unassigned', () => {
-    const vps = db.createActuator(testDb, accountId, 'VPS', 'vps', agentId);
-    const agent2 = db.createAgent(testDb, accountId, 'Agent 2');
-    // vps is not assigned to agent2
-    expect(db.resolveActuatorForAgent(testDb, agent2.id, vps.id)).toBeNull();
-  });
-
-  it('resolveAgentForActuator returns owning agent', () => {
-    const vps = db.createActuator(testDb, accountId, 'VPS', 'vps', agentId);
-    const owner = db.resolveAgentForActuator(testDb, vps.id);
-    expect(owner).toBeTruthy();
-    expect(owner!.id).toBe(agentId);
-  });
-
-  it('resolveAgentForActuator returns null for unassigned', () => {
-    const vps = db.createActuator(testDb, accountId, 'Unassigned', 'vps');
-    expect(db.resolveAgentForActuator(testDb, vps.id)).toBeNull();
-  });
-
-  it('assignActuatorToAgent rejects cross-account', () => {
-    const account2 = db.createAccount(testDb, 'other@example.com', 'hash').id;
-    const agent2 = db.createAgent(testDb, account2, 'Other Agent').id;
-    const vps = db.createActuator(testDb, accountId, 'VPS', 'vps', agentId);
-    expect(db.assignActuatorToAgent(testDb, agent2, vps.id)).toBe(false);
+  it('does not find offline actuator when onlineOnly', () => {
+    const act = db.createActuator(testDb, agentId, 'VPS');
+    db.addCapability(testDb, act.id, 'git');
+    expect(db.findActuatorWithCapability(testDb, agentId, 'git', true)).toBeNull();
   });
 
   it('deletes actuator and cascades capabilities', () => {
-    const act = db.createActuator(testDb, accountId, 'VPS', 'vps', agentId);
+    const act = db.createActuator(testDb, agentId, 'VPS');
     db.addCapability(testDb, act.id, 'git');
     db.deleteActuator(testDb, act.id);
     expect(db.getActuatorById(testDb, act.id)).toBeNull();
@@ -416,7 +367,7 @@ describe('Command Queue', () => {
     testDb = createTestDb();
     const accountId = db.createAccount(testDb, 'test@example.com', 'hash123').id;
     agentId = db.createAgent(testDb, accountId, 'Agent').id;
-    actuatorId = db.createActuator(testDb, accountId, 'VPS', 'vps', agentId).id;
+    actuatorId = db.createActuator(testDb, agentId, 'VPS').id;
   });
 
   it('creates and retrieves command', () => {

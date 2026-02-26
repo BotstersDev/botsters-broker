@@ -23,6 +23,7 @@ function createTestApp() {
   const schemaPath = path.join(import.meta.dirname || '.', '..', 'schema.sql');
   const schema = fs.readFileSync(schemaPath, 'utf-8');
   database.exec(schema);
+  db.migrateMultiActuatorAssignments(database);
 
   const app = new Hono<{ Bindings: Env }>();
   app.use('*', async (c, next) => {
@@ -121,5 +122,27 @@ describe('Inference Proxy', () => {
 
     const openai = body.providers.find((p: any) => p.name === 'openai');
     expect(openai.configured).toBe(false);
+
+    const xai = body.providers.find((p: any) => p.name === 'xai');
+    expect(xai.configured).toBe(false);
+  });
+
+  it('lists xai as configured when XAI_TOKEN exists', async () => {
+    const { app, database } = createTestApp();
+    const account = db.createAccount(database, 'test@test.com', 'hash');
+    const agent = db.createAgent(database, account.id, 'test-agent');
+
+    const encryptedKey = encrypt('xai-test-token', MASTER_KEY);
+    db.createSecret(database, account.id, 'XAI_TOKEN', 'xai', encryptedKey);
+
+    const res = await app.request('/inference/providers', {
+      headers: { 'Authorization': `Bearer ${agent._plaintext_token}` },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+
+    const xai = body.providers.find((p: any) => p.name === 'xai');
+    expect(xai.configured).toBe(true);
   });
 });
