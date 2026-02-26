@@ -51,6 +51,14 @@ export class CommandRouter {
     const brainConn = this.hub.getBrainConnection(agentId);
     const action = this.deriveAction(msg.capability, msg.payload);
 
+    // Safe mode check — block all commands when global or per-agent safe mode is active
+    if (db.getGlobalSafe(this.database) || db.getAgentSafe(this.database, agentId)) {
+      const err = 'Command blocked: safe mode is active';
+      if (brainConn) brainConn.ws.send(serialize(makeError('safe_mode', err, msg.id)));
+      db.logAudit(this.database, accountId, agentId, 'command.blocked.safe_mode', 'command', 'blocked');
+      return { commandId: null, error: err };
+    }
+
     // Resolve actuator through the selection chain
     const actuator = db.resolveActuatorForAgent(this.database, agentId, msg.actuator_id || undefined);
 
