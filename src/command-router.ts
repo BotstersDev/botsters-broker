@@ -8,9 +8,31 @@ import * as db from './db.js';
 import { decrypt } from './crypto.js';
 import type { CommandRequest, CommandResult, CredentialRequest } from './protocol.js';
 import { serialize, makeError } from './protocol.js';
+import { actuatorTap } from './actuator-tap.js';
 
 export class CommandRouter {
   private pendingResults = new Map<string, { resolve: (result: any) => void; timer: ReturnType<typeof setTimeout> }>();
+
+  private deriveAction(capability: string, payload: unknown): string {
+    if (payload && typeof payload === 'object' && 'action' in payload && typeof (payload as { action?: unknown }).action === 'string') {
+      return (payload as { action: string }).action;
+    }
+    return capability;
+  }
+
+  private publishActuatorError(actuatorId: string | null | undefined, commandId: string | undefined, data: string): void {
+    if (!actuatorId) return;
+    const actuator = db.getActuatorById(this.database, actuatorId);
+    if (!actuator) return;
+    actuatorTap.publish({
+      actuatorId,
+      actuatorName: actuator.name,
+      timestamp: new Date().toISOString(),
+      type: 'error',
+      commandId,
+      data,
+    });
+  }
 
   constructor(
     private database: Database.Database,
@@ -27,6 +49,7 @@ export class CommandRouter {
    */
   handleCommandRequest(agentId: string, accountId: string, msg: CommandRequest): { commandId: string | null; error?: string } {
     const brainConn = this.hub.getBrainConnection(agentId);
+    const action = this.deriveAction(msg.capability, msg.payload);
 
     // Resolve actuator through the selection chain
     const actuator = db.resolveActuatorForAgent(this.database, agentId, msg.actuator_id || undefined);
@@ -38,6 +61,9 @@ export class CommandRouter {
           type: 'result_delivery', id: msg.id, status: 'completed', result: null,
         }));
       }
+      if (msg.actuator_id) {
+        this.publishActuatorError(msg.actuator_id, msg.id, 'No valid actuator resolved');
+      }
       return { commandId: null };
     }
 
@@ -46,6 +72,7 @@ export class CommandRouter {
     if (!caps.some(c => c.capability === msg.capability)) {
       const err = `Actuator ${actuator.id} lacks capability: ${msg.capability}. Available: ${caps.map(c => c.capability).join(', ') || 'none'}`;
       if (brainConn) brainConn.ws.send(serialize(makeError('no_capability', err, msg.id)));
+      this.publishActuatorError(actuator.id, msg.id, err);
       return { commandId: null, error: err };
     }
 
@@ -57,6 +84,14 @@ export class CommandRouter {
     if (actuatorConn) {
       actuatorConn.ws.send(serialize({ type: 'command_delivery', id: cmd.id, capability: msg.capability, payload: msg.payload }));
       db.updateCommandStatus(this.database, cmd.id, 'delivered');
+      actuatorTap.publish({
+        actuatorId: actuator.id,
+        actuatorName: actuator.name,
+        timestamp: new Date().toISOString(),
+        type: 'command',
+        commandId: cmd.id,
+        action,
+      });
     } else {
       // Actuator registered but not currently connected — command stays pending
       if (brainConn) {
@@ -65,6 +100,7 @@ export class CommandRouter {
           result: { queued: true, command_id: cmd.id, reason: 'Actuator offline, command queued for delivery' },
         }));
       }
+      this.publishActuatorError(actuator.id, cmd.id, 'Actuator offline, command queued for delivery');
       return { commandId: cmd.id, error: 'Actuator offline, command queued' };
     }
 
@@ -74,11 +110,24 @@ export class CommandRouter {
   /**
    * Handle a command result from an actuator
    */
-  handleCommandResult(agentId: string, msg: CommandResult): void {
+  handleCommandResult(actuatorId: string, msg: CommandResult): void {
     const cmd = db.getCommandById(this.database, msg.id);
-    if (!cmd || cmd.agent_id !== agentId) return;
+    if (!cmd || cmd.actuator_id !== actuatorId) return;
 
     db.updateCommandStatus(this.database, msg.id, msg.status, JSON.stringify(msg.result));
+    const actuator = db.getActuatorById(this.database, actuatorId);
+    let durationMs: number | undefined = undefined;
+    const startedAt = Date.parse(cmd.created_at);
+    if (!Number.isNaN(startedAt)) durationMs = Math.max(0, Date.now() - startedAt);
+    actuatorTap.publish({
+      actuatorId,
+      actuatorName: actuator?.name || actuatorId,
+      timestamp: new Date().toISOString(),
+      type: 'result',
+      commandId: msg.id,
+      status: msg.status === 'completed' ? 'ok' : 'error',
+      durationMs,
+    });
 
     // Resolve any pending REST sync request
     const pending = this.pendingResults.get(msg.id);
@@ -89,7 +138,7 @@ export class CommandRouter {
     }
 
     // Route result to brain via WS
-    const brainConn = this.hub.getBrainConnection(agentId);
+    const brainConn = this.hub.getBrainConnection(cmd.agent_id);
     if (brainConn) {
       brainConn.ws.send(serialize({ type: 'result_delivery', id: msg.id, status: msg.status, result: msg.result }));
     }
@@ -110,6 +159,10 @@ export class CommandRouter {
 
       const timer = setTimeout(() => {
         this.pendingResults.delete(commandId);
+        const timedOutCmd = db.getCommandById(this.database, commandId);
+        if (timedOutCmd) {
+          this.publishActuatorError(timedOutCmd.actuator_id, commandId, 'Command timed out waiting for result');
+        }
         resolve(null);
       }, timeoutMs);
 
@@ -142,13 +195,23 @@ export class CommandRouter {
   deliverQueuedCommands(agentId: string, actuatorId: string): void {
     const actuatorConn = this.hub.getActuatorConnection(agentId, actuatorId);
     if (!actuatorConn) return;
+    const actuator = db.getActuatorById(this.database, actuatorId);
 
     const pending = db.getPendingCommands(this.database, actuatorId);
     for (const cmd of pending) {
       // Only deliver commands explicitly assigned to this actuator
       if (cmd.actuator_id !== actuatorId) continue;
-      actuatorConn.ws.send(serialize({ type: 'command_delivery', id: cmd.id, capability: cmd.capability, payload: JSON.parse(cmd.payload) }));
+      const payload = JSON.parse(cmd.payload);
+      actuatorConn.ws.send(serialize({ type: 'command_delivery', id: cmd.id, capability: cmd.capability, payload }));
       db.updateCommandStatus(this.database, cmd.id, 'delivered');
+      actuatorTap.publish({
+        actuatorId,
+        actuatorName: actuator?.name || actuatorId,
+        timestamp: new Date().toISOString(),
+        type: 'command',
+        commandId: cmd.id,
+        action: this.deriveAction(cmd.capability, payload),
+      });
     }
   }
 }
