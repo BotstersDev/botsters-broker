@@ -14,6 +14,7 @@ import path from 'node:path';
 
 import { apiRoutes } from './api.js';
 import { accountRoutes } from './api-accounts.js';
+import { createNotifyRoutes } from './api-notify.js';
 import { inferenceRoutes } from './inference.js';
 import { webRoutes } from './web.js';
 import { WsHub } from './ws-hub.js';
@@ -44,12 +45,15 @@ if (fs.existsSync(schemaPath)) {
   console.log('Schema applied successfully');
 }
 
+db.migrateMultiActuatorAssignments(database);
+
 // Build Hono app with env bindings
 const app = new Hono<{ Bindings: Env }>();
 
 // Create WebSocket hub and router first
 const hub = new WsHub(database, config);
 const router = new CommandRouter(database, hub, config.masterKey);
+const notifyRoutes = createNotifyRoutes(hub);
 hub.setRouter(router);
 
 // Inject env bindings into every request
@@ -69,6 +73,7 @@ app.route('/v1', apiRoutes);
 // Account management API routes
 app.route('/api', accountRoutes);
 app.route('/v1/api', accountRoutes);
+app.route('/v1', notifyRoutes);
 
 // Inference proxy routes (the spine's core capability)
 app.route('/v1', inferenceRoutes);
@@ -84,6 +89,7 @@ app.get('/v1/actuators', async (c) => {
   return c.json(conns.map(a => ({
     actuatorId: a.actuatorId,
     agentId: a.agentId,
+    assignedAgentIds: a.assignedAgentIds,
     capabilities: a.capabilities,
     connId: a.connId,
   })));
@@ -103,8 +109,7 @@ app.post('/v1/actuator/select', async (c) => {
 
   // Validate if non-null
   if (actuatorId) {
-    const actuator = db.getActuatorById(database, actuatorId);
-    if (!actuator || actuator.agent_id !== agent.id) {
+    if (!db.isActuatorAssignedToAgent(database, agent.id, actuatorId)) {
       return c.json({ error: 'Actuator not found or not owned by this agent' }, 404);
     }
   }
@@ -127,10 +132,10 @@ app.get('/v1/actuator/selected', async (c) => {
     return c.json({ actuator_id: actuator.id, name: actuator.name, type: actuator.type, status: actuator.status });
   }
 
-  // Check auto-select
-  const all = db.listActuators(database, agent.id);
-  if (all.length === 1) {
-    return c.json({ actuator_id: all[0].id, name: all[0].name, type: all[0].type, status: all[0].status, auto_selected: true });
+  // Check auto-select (enabled assignments only)
+  const resolved = db.resolveActuatorForAgent(database, agent.id);
+  if (resolved) {
+    return c.json({ actuator_id: resolved.id, name: resolved.name, type: resolved.type, status: resolved.status, auto_selected: !agent.selected_actuator_id });
   }
 
   return c.json({ actuator_id: null, message: 'No actuator selected' });
@@ -154,7 +159,7 @@ app.post('/v1/command', async (c) => {
   } else if (token.startsWith('seks_actuator_')) {
     const actuator = db.getActuatorByToken(database, token);
     if (!actuator) return c.json({ error: 'Invalid token' }, 401);
-    const owner = db.getAgentById(database, actuator.agent_id);
+    const owner = db.resolveAgentForActuator(database, actuator.id);
     if (!owner) return c.json({ error: 'Invalid token' }, 401);
     agentId = owner.id;
     accountId = owner.account_id;
