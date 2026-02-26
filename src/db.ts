@@ -498,6 +498,12 @@ export function migrateMultiActuatorAssignments(db: Database.Database): void {
             AND aa.enabled = 1
         );
     `);
+    // Safe mode tables
+    if (!hasColumn(db, 'agents', 'safe')) {
+        db.exec('ALTER TABLE agents ADD COLUMN safe INTEGER NOT NULL DEFAULT 0');
+    }
+    db.exec("CREATE TABLE IF NOT EXISTS broker_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    db.exec("INSERT OR IGNORE INTO broker_settings (key, value) VALUES ('global_safe', '0')");
 }
 
 export function getAgentByName(db: Database.Database, name: string): Agent | null {
@@ -552,4 +558,24 @@ export function listAgentActuatorAssignmentsByAccount(db: Database.Database, acc
         JOIN agents ag ON ag.id = aa.agent_id
         WHERE ag.account_id = ?
     `).all(accountId) as Array<{ agent_id: string; actuator_id: string; enabled: number; assigned_at: string }>;
+}
+
+// ─── Safe Mode ─────────────────────────────────────────────────────────────────
+
+export function getAgentSafe(db: Database.Database, agentId: string): boolean {
+    const row = db.prepare('SELECT safe FROM agents WHERE id = ?').get(agentId) as { safe: number } | undefined;
+    return row ? !!row.safe : false;
+}
+
+export function setAgentSafe(db: Database.Database, agentId: string, safe: boolean): void {
+    db.prepare('UPDATE agents SET safe = ? WHERE id = ?').run(safe ? 1 : 0, agentId);
+}
+
+export function getGlobalSafe(db: Database.Database): boolean {
+    const row = db.prepare('SELECT value FROM broker_settings WHERE key = ?').get('global_safe') as { value: string } | undefined;
+    return row ? row.value === '1' : false;
+}
+
+export function setGlobalSafe(db: Database.Database, safe: boolean): void {
+    db.prepare('INSERT OR REPLACE INTO broker_settings (key, value) VALUES (?, ?)').run('global_safe', safe ? '1' : '0');
 }
