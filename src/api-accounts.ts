@@ -161,7 +161,7 @@ accountRoutes.post('/accounts/:id/agents/:agentId/rotate-token', (c) => {
 
 // ─── Actuator Management (account-scoped) ──────────────────────────────────────
 
-// POST /api/agents/:id/actuators — register actuator
+// POST /api/agents/:id/actuators — register actuator (and assign to agent)
 accountRoutes.post('/agents/:agentId/actuators', async (c) => {
   const denied = requireAdmin(c);
   if (denied) return denied;
@@ -173,7 +173,7 @@ accountRoutes.post('/agents/:agentId/actuators', async (c) => {
   const body = await c.req.json<{ name: string; type?: string }>();
   if (!body.name) return c.json({ ok: false, error: 'Missing name' }, 400);
 
-  const actuator = db.createActuator(c.env.db, agentId, body.name, body.type || 'vps');
+  const actuator = db.createActuator(c.env.db, agent.account_id, body.name, body.type || 'vps', agentId);
   db.logAudit(c.env.db, agent.account_id, agentId, 'actuator.create', actuator.id, 'success');
 
   return c.json({ ok: true, actuator }, 201);
@@ -189,7 +189,11 @@ accountRoutes.get('/agents/:agentId/actuators', (c) => {
   if (!agent) return c.json({ ok: false, error: 'Agent not found' }, 404);
 
   const actuators = db.listActuators(c.env.db, agentId);
-  const withCaps = actuators.map(a => ({ ...a, capabilities: db.listCapabilities(c.env.db, a.id) }));
+  const withCaps = actuators.map(a => ({
+    ...a,
+    assignment: db.listActuatorAssignments(c.env.db, a.id).find(asg => asg.agent_id === agentId) || null,
+    capabilities: db.listCapabilities(c.env.db, a.id),
+  }));
   return c.json({ ok: true, actuators: withCaps });
 });
 
@@ -200,8 +204,10 @@ accountRoutes.patch('/agents/:agentId/actuators/:actId', async (c) => {
 
   const agentId = c.req.param('agentId');
   const actId = c.req.param('actId');
+  const agent = db.getAgentById(c.env.db, agentId);
+  if (!agent) return c.json({ ok: false, error: 'Agent not found' }, 404);
   const actuator = db.getActuatorById(c.env.db, actId);
-  if (!actuator || actuator.agent_id !== agentId) return c.json({ ok: false, error: 'Actuator not found' }, 404);
+  if (!actuator || actuator.account_id !== agent.account_id) return c.json({ ok: false, error: 'Actuator not found' }, 404);
 
   const body = await c.req.json<{ capabilities?: Array<{ capability: string; constraints?: string }> }>();
   if (body.capabilities) {
@@ -215,8 +221,7 @@ accountRoutes.patch('/agents/:agentId/actuators/:actId', async (c) => {
     }
   }
 
-  const agent = db.getAgentById(c.env.db, agentId);
-  if (agent) db.logAudit(c.env.db, agent.account_id, agentId, 'actuator.update', actId, 'success');
+  db.logAudit(c.env.db, agent.account_id, agentId, 'actuator.update', actId, 'success');
 
   const caps = db.listCapabilities(c.env.db, actId);
   return c.json({ ok: true, actuator: { ...actuator, capabilities: caps } });
@@ -229,13 +234,59 @@ accountRoutes.delete('/agents/:agentId/actuators/:actId', (c) => {
 
   const agentId = c.req.param('agentId');
   const actId = c.req.param('actId');
+  const agent = db.getAgentById(c.env.db, agentId);
+  if (!agent) return c.json({ ok: false, error: 'Agent not found' }, 404);
   const actuator = db.getActuatorById(c.env.db, actId);
-  if (!actuator || actuator.agent_id !== agentId) return c.json({ ok: false, error: 'Actuator not found' }, 404);
+  if (!actuator || actuator.account_id !== agent.account_id) return c.json({ ok: false, error: 'Actuator not found' }, 404);
 
   db.deleteActuator(c.env.db, actId);
-  const agent = db.getAgentById(c.env.db, agentId);
-  if (agent) db.logAudit(c.env.db, agent.account_id, agentId, 'actuator.delete', actId, 'success');
+  db.logAudit(c.env.db, agent.account_id, agentId, 'actuator.delete', actId, 'success');
 
+  return c.json({ ok: true });
+});
+
+// POST /api/agents/:agentId/actuators/:actId/assign — assign actuator to agent
+accountRoutes.post('/agents/:agentId/actuators/:actId/assign', async (c) => {
+  const denied = requireAdmin(c);
+  if (denied) return denied;
+
+  const agentId = c.req.param('agentId');
+  const actId = c.req.param('actId');
+  const body = await c.req.json<{ enabled?: boolean }>();
+  const ok = db.assignActuatorToAgent(c.env.db, agentId, actId, body.enabled === false ? 0 : 1);
+  if (!ok) return c.json({ ok: false, error: 'Agent/actuator not found or account mismatch' }, 400);
+
+  const agent = db.getAgentById(c.env.db, agentId)!;
+  db.logAudit(c.env.db, agent.account_id, agentId, 'actuator.assign', actId, 'success');
+  return c.json({ ok: true });
+});
+
+// DELETE /api/agents/:agentId/actuators/:actId/assign — remove assignment
+accountRoutes.delete('/agents/:agentId/actuators/:actId/assign', (c) => {
+  const denied = requireAdmin(c);
+  if (denied) return denied;
+
+  const agentId = c.req.param('agentId');
+  const actId = c.req.param('actId');
+  const agent = db.getAgentById(c.env.db, agentId);
+  if (!agent) return c.json({ ok: false, error: 'Agent not found' }, 404);
+  db.removeActuatorAssignment(c.env.db, agentId, actId);
+  db.logAudit(c.env.db, agent.account_id, agentId, 'actuator.unassign', actId, 'success');
+  return c.json({ ok: true });
+});
+
+// POST /api/agents/:agentId/actuators/:actId/toggle-assignment — toggle assignment enabled
+accountRoutes.post('/agents/:agentId/actuators/:actId/toggle-assignment', (c) => {
+  const denied = requireAdmin(c);
+  if (denied) return denied;
+
+  const agentId = c.req.param('agentId');
+  const actId = c.req.param('actId');
+  const agent = db.getAgentById(c.env.db, agentId);
+  if (!agent) return c.json({ ok: false, error: 'Agent not found' }, 404);
+  const ok = db.toggleAgentActuatorAssignmentEnabled(c.env.db, agentId, actId);
+  if (!ok) return c.json({ ok: false, error: 'Assignment not found' }, 404);
+  db.logAudit(c.env.db, agent.account_id, agentId, 'actuator.assignment.toggle', actId, 'success');
   return c.json({ ok: true });
 });
 

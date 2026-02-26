@@ -32,12 +32,30 @@ function authenticateAgent(c: any): Agent | null {
   }
 
   const agent = db.getAgentByToken(database, token);
-  if (agent) db.updateAgentLastSeen(database, agent.id);
-  return agent;
+  if (agent) { db.updateAgentLastSeen(database, agent.id); return agent; }
+
+  // Actuator token: resolve to parent agent
+  if (token.startsWith("seks_actuator_")) {
+    const actuator = db.getActuatorByToken(database, token);
+    if (actuator) {
+      const parentAgent = db.resolveAgentForActuator(database, actuator.id);
+      if (parentAgent) {
+        db.updateAgentLastSeen(database, parentAgent.id);
+        c.set("authenticatedActuator", actuator);
+        return parentAgent;
+      }
+    }
+  }
+  return null;
 }
 
 function getMasterKey(env: Env): string {
   return env.masterKey;
+}
+
+function authenticateAdmin(c: any): boolean {
+  const adminKey = c.req.header('X-Admin-Key');
+  return !!adminKey && adminKey === c.env.masterKey;
 }
 
 // ─── Health Check ──────────────────────────────────────────────────────────────
@@ -458,11 +476,101 @@ async function handlePassthrough(c: any, provider: string) {
 
     db.logAudit(c.env.db, agentRecord.account_id, agentRecord.id, 'passthrough', provider, response.ok ? 'success' : 'error', null, `${c.req.method} ${path} → ${response.status}`);
 
+    const { inferenceTap } = await import('./inference-tap.js');
+    const agentName = agentRecord.name || agentRecord.id;
+    inferenceTap.publish({
+      agentId: agentRecord.id,
+      agentName,
+      provider,
+      method: c.req.method,
+      path,
+      timestamp: new Date().toISOString(),
+      type: 'request',
+      data: `${c.req.method} ${path} → ${response.status}`,
+    });
+
+    const contentType = response.headers.get('content-type') || '';
+    if (contentType.includes('text/event-stream') && response.body) {
+      const [agentStream, tapStream] = response.body.tee();
+      processTapStream(tapStream, agentRecord.id, agentName, provider, path).catch(() => {});
+
+      return new Response(agentStream, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      });
+    }
+
     return new Response(response.body, { status: response.status, statusText: response.statusText, headers: response.headers });
   } catch (e) {
     const error = e instanceof Error ? e.message : 'Unknown error';
     db.logAudit(c.env.db, agentRecord.account_id, agentRecord.id, 'passthrough', provider, 'error', null, error);
     return c.json({ error: `Request failed: ${error}` }, 502);
+  }
+}
+
+async function processTapStream(stream: ReadableStream, agentId: string, agentName: string, provider: string, path: string) {
+  const { inferenceTap } = await import('./inference-tap.js');
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const text = decoder.decode(value, { stream: true });
+
+      const lines = text.split('\n');
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const jsonStr = line.slice(6).trim();
+        if (jsonStr === '[DONE]') continue;
+
+        try {
+          const parsed = JSON.parse(jsonStr);
+          let content = '';
+
+          if (parsed.delta?.text) content = parsed.delta.text;
+          else if (parsed.choices?.[0]?.delta?.content) content = parsed.choices[0].delta.content;
+
+          if (content) {
+            inferenceTap.publish({
+              agentId,
+              agentName,
+              provider,
+              method: 'STREAM',
+              path,
+              timestamp: new Date().toISOString(),
+              type: 'chunk',
+              data: content,
+            });
+          }
+        } catch {
+          // skip unparseable chunks
+        }
+      }
+    }
+
+    inferenceTap.publish({
+      agentId,
+      agentName,
+      provider,
+      method: 'STREAM',
+      path,
+      timestamp: new Date().toISOString(),
+      type: 'complete',
+    });
+  } catch (err) {
+    inferenceTap.publish({
+      agentId,
+      agentName,
+      provider,
+      method: 'STREAM',
+      path,
+      timestamp: new Date().toISOString(),
+      type: 'error',
+      data: err instanceof Error ? err.message : 'Unknown error',
+    });
   }
 }
 
@@ -682,25 +790,30 @@ apiRoutes.get('/actuators', (c) => {
   const agent = authenticateAgent(c);
   if (!agent) return c.json({ ok: false, error: 'Unauthorized' }, 401);
   const actuators = db.listActuators(c.env.db, agent.id);
-  const withCaps = actuators.map(a => ({ ...a, capabilities: db.listCapabilities(c.env.db, a.id) }));
+  const withCaps = actuators.map(a => {
+    const assignment = db.listActuatorAssignments(c.env.db, a.id).find(asg => asg.agent_id === agent.id);
+    return { ...a, assignment_enabled: assignment?.enabled ?? 0, capabilities: db.listCapabilities(c.env.db, a.id) };
+  });
   return c.json({ ok: true, actuators: withCaps });
 });
 
 apiRoutes.post('/actuators', async (c) => {
   const agent = authenticateAgent(c);
   if (!agent) return c.json({ ok: false, error: 'Unauthorized' }, 401);
+  if (!authenticateAdmin(c)) return c.json({ ok: false, error: 'Forbidden: admin only' }, 403);
   const body = await c.req.json<{ name: string; type?: string }>();
   if (!body.name) return c.json({ ok: false, error: 'Missing name' }, 400);
-  const actuator = db.createActuator(c.env.db, agent.id, body.name, body.type || 'vps');
+  const actuator = db.createActuator(c.env.db, agent.account_id, body.name, body.type || 'vps', agent.id);
   return c.json({ ok: true, actuator }, 201);
 });
 
 apiRoutes.delete('/actuators/:id', (c) => {
   const agent = authenticateAgent(c);
   if (!agent) return c.json({ ok: false, error: 'Unauthorized' }, 401);
+  if (!authenticateAdmin(c)) return c.json({ ok: false, error: 'Forbidden: admin only' }, 403);
   const id = c.req.param('id');
   const actuator = db.getActuatorById(c.env.db, id);
-  if (!actuator || actuator.agent_id !== agent.id) return c.json({ ok: false, error: 'Not found' }, 404);
+  if (!actuator || actuator.account_id !== agent.account_id) return c.json({ ok: false, error: 'Not found' }, 404);
   db.deleteActuator(c.env.db, id);
   return c.json({ ok: true });
 });
@@ -708,9 +821,10 @@ apiRoutes.delete('/actuators/:id', (c) => {
 apiRoutes.post('/actuators/:id/capabilities', async (c) => {
   const agent = authenticateAgent(c);
   if (!agent) return c.json({ ok: false, error: 'Unauthorized' }, 401);
+  if (!authenticateAdmin(c)) return c.json({ ok: false, error: 'Forbidden: admin only' }, 403);
   const id = c.req.param('id');
   const actuator = db.getActuatorById(c.env.db, id);
-  if (!actuator || actuator.agent_id !== agent.id) return c.json({ ok: false, error: 'Not found' }, 404);
+  if (!actuator || actuator.account_id !== agent.account_id) return c.json({ ok: false, error: 'Not found' }, 404);
   const body = await c.req.json<{ capability: string; constraints?: string }>();
   if (!body.capability) return c.json({ ok: false, error: 'Missing capability' }, 400);
   const cap = db.addCapability(c.env.db, id, body.capability, body.constraints);
@@ -720,10 +834,11 @@ apiRoutes.post('/actuators/:id/capabilities', async (c) => {
 apiRoutes.delete('/actuators/:id/capabilities/:cap', (c) => {
   const agent = authenticateAgent(c);
   if (!agent) return c.json({ ok: false, error: 'Unauthorized' }, 401);
+  if (!authenticateAdmin(c)) return c.json({ ok: false, error: 'Forbidden: admin only' }, 403);
   const id = c.req.param('id');
   const cap = c.req.param('cap');
   const actuator = db.getActuatorById(c.env.db, id);
-  if (!actuator || actuator.agent_id !== agent.id) return c.json({ ok: false, error: 'Not found' }, 404);
+  if (!actuator || actuator.account_id !== agent.account_id) return c.json({ ok: false, error: 'Not found' }, 404);
   db.removeCapability(c.env.db, id, cap);
   return c.json({ ok: true });
 });

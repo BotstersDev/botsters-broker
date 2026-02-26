@@ -19,6 +19,7 @@ function createTestApp(): { app: Hono<{ Bindings: Env }>; database: Database.Dat
   database.pragma('foreign_keys = ON');
   const schemaPath = path.join(import.meta.dirname || '.', '..', 'schema.sql');
   database.exec(fs.readFileSync(schemaPath, 'utf-8'));
+  db.migrateMultiActuatorAssignments(database);
 
   const app = new Hono<{ Bindings: Env }>();
   app.use('*', async (c, next) => {
