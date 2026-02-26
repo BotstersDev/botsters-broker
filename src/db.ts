@@ -109,7 +109,7 @@ export function createSecret(db: Database.Database, accountId: string, name: str
     db.prepare('INSERT INTO secrets (id, account_id, name, provider, encrypted_value, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, accountId, name, provider, encryptedValue, now, now);
     return { id, account_id: accountId, name, provider, encrypted_value: encryptedValue, metadata: null, created_at: now, updated_at: now };
 }
-export function getSecretsByPrefix(db: Database.Database, accountId: string, namePrefix: string, agentId?: string): Secret[] {
+export function getSecretsByPrefix(db: Database.Database, accountId: string, namePrefix: string, agentId?: string | null): Secret[] {
     const pattern = `${namePrefix}%`;
     if (agentId) {
         return db.prepare(`
@@ -124,7 +124,7 @@ export function getSecretsByPrefix(db: Database.Database, accountId: string, nam
     }
     return db.prepare('SELECT * FROM secrets WHERE account_id = ? AND name LIKE ? ORDER BY name').all(accountId, pattern) as Secret[];
 }
-export function getSecret(db: Database.Database, accountId: string, name: string, agentId?: string): Secret | null {
+export function getSecret(db: Database.Database, accountId: string, name: string, agentId?: string | null): Secret | null {
     if (agentId) {
         return db.prepare(`
       SELECT s.* FROM secrets s
@@ -137,7 +137,7 @@ export function getSecret(db: Database.Database, accountId: string, name: string
     }
     return db.prepare('SELECT * FROM secrets WHERE account_id = ? AND name = ?').get(accountId, name) as Secret | undefined ?? null;
 }
-export function listSecrets(db: Database.Database, accountId: string, agentId?: string): Secret[] {
+export function listSecrets(db: Database.Database, accountId: string, agentId?: string | null): Secret[] {
     if (agentId) {
         return db.prepare(`
       SELECT s.* FROM secrets s
@@ -173,7 +173,7 @@ export function isSecretGlobal(db: Database.Database, secretId: string): boolean
     return row.count === 0;
 }
 // ─── Audit Log ─────────────────────────────────────────────────────────────────
-export function logAudit(db: Database.Database, accountId: string, agentId: string | null, action: string, resource: string | null, status: string, ipAddress?: string, details?: string): void {
+export function logAudit(db: Database.Database, accountId: string, agentId: string | null, action: string, resource: string | null, status: string, ipAddress?: string | null, details?: string | null): void {
     const id = generateId();
     const now = new Date().toISOString();
     db.prepare('INSERT INTO audit_log (id, account_id, agent_id, action, resource, status, ip_address, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, accountId, agentId, action, resource, status, ipAddress ?? null, details ?? null, now);

@@ -8,8 +8,8 @@ export interface InferenceEvent {
   path: string;
   timestamp: string;
   type: 'request' | 'chunk' | 'complete' | 'error';
-  data?: string;
-  model?: string;
+  data?: string | null;
+  model?: string | null;
   tokensIn?: number;
   tokensOut?: number;
 }

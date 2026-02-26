@@ -5,10 +5,10 @@ export interface ActuatorEvent {
   actuatorName: string;
   timestamp: string;
   type: 'command' | 'result' | 'connect' | 'disconnect' | 'error';
-  data?: string;
-  commandId?: string;
-  action?: string;
-  status?: string;
+  data?: string | null;
+  commandId?: string | null;
+  action?: string | null;
+  status?: string | null;
   durationMs?: number;
 }
 
