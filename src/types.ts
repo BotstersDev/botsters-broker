@@ -88,14 +88,24 @@ export interface SecretAccess {
 
 export interface Actuator {
   id: string;
-  agent_id: string;
+  account_id: string;
+  // Legacy ownership field retained for compatibility/migration only.
+  agent_id: string | null;
   name: string;
   type: string;
   status: string;
+  enabled: number;
   last_seen_at: string | null;
   created_at: string;
   token_hash: string | null;
   encrypted_token: string | null;
+}
+
+export interface AgentActuatorAssignment {
+  agent_id: string;
+  actuator_id: string;
+  enabled: number;
+  assigned_at: string;
 }
 
 export interface Capability {
